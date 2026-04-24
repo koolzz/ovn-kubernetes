@@ -291,13 +291,13 @@ var _ = ginkgo.Describe("Cluster Controller Manager", func() {
 					nil,
 				),
 				ginkgo.Entry(
-					"does not manage localnet topologies on non-IC deployments without subnets",
+					"does not manage localnet topologies when interconnect is disabled without subnets",
 					&ovncnitypes.NetConf{NetConf: types.NetConf{Name: "blue"}, Topology: ovntypes.LocalnetTopology},
 					config.OVNKubernetesFeatureConfig{EnableMultiNetwork: true},
 					networkmanager.ErrNetworkControllerTopologyNotManaged,
 				),
 				ginkgo.Entry(
-					"does not manage localnet topologies on non-IC deployments with subnets",
+					"does not manage localnet topologies when interconnect is disabled with subnets",
 					&ovncnitypes.NetConf{
 						NetConf:  types.NetConf{Name: "blue"},
 						Topology: ovntypes.LocalnetTopology,

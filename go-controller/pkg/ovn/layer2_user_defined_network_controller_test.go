@@ -1478,7 +1478,7 @@ func setupFakeOvnForLayer2Topology(fakeOvn *FakeOVN, initialDB libovsdbtest.Test
 	}
 
 	if !config.OVNKubernetesFeature.EnableInterconnect {
-		// In non-IC unit tests, seed the default-network pod annotation directly.
+		// In unit tests with interconnect disabled, seed the default-network pod annotation directly.
 		// This helper only validates UDN topology in NBDB, so starting the default
 		// controller path here would add unrelated default-network objects. IC tests
 		// do not assert the full default annotation in this setup path.
