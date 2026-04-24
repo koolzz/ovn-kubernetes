@@ -18,11 +18,6 @@ function usage() {
 
 # Default values for flags
 BUILD_IMAGE=${BUILD_IMAGE:-false}
-
-if [[ "${OVN_INTERCONNECT:-true}" != "true" ]]; then
-  echo "OVN_INTERCONNECT must be true."
-  exit 1
-fi
 VALUES_FILE="values-single-node-zone.yaml"
 
 # Verify dependencies
