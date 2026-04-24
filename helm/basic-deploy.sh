@@ -11,22 +11,19 @@ function usage() {
   echo ""
   echo "Options:"
   echo "  BUILD_IMAGE=${BUILD_IMAGE:-false}      Set to true to build the Docker image instead of pulling it."
-  echo "  OVN_INTERCONNECT=${OVN_INTERCONNECT:-true}  Set to false to use a non-interconnect deployment (values-no-ic.yaml)."
   echo ""
-  echo "Example: BUILD_IMAGE=true OVN_INTERCONNECT=false $0"
+  echo "Example: BUILD_IMAGE=true $0"
   exit 1
 }
 
 # Default values for flags
 BUILD_IMAGE=${BUILD_IMAGE:-false}
-OVN_INTERCONNECT=${OVN_INTERCONNECT:-true}
 
-# Determine the values file based on OVN_INTERCONNECT
-if [[ "$OVN_INTERCONNECT" == "true" ]]; then
-  VALUES_FILE="values-single-node-zone.yaml"
-else
-  VALUES_FILE="values-no-ic.yaml"
+if [[ "${OVN_INTERCONNECT:-true}" != "true" ]]; then
+  echo "OVN_INTERCONNECT must be true."
+  exit 1
 fi
+VALUES_FILE="values-single-node-zone.yaml"
 
 # Verify dependencies
 check_command() {
@@ -84,12 +81,9 @@ EOF
 
 kind load docker-image --name $kind_cluster_name $IMG
 
-# Node labeling based on OVN_INTERCONNECT
-if [[ "$OVN_INTERCONNECT" == "true" ]]; then
-  for n in $(kind get nodes --name "${kind_cluster_name}"); do
-    kubectl label node "${n}" k8s.ovn.org/zone-name=${n} --overwrite
-  done
-fi
+for n in $(kind get nodes --name "${kind_cluster_name}"); do
+  kubectl label node "${n}" k8s.ovn.org/zone-name=${n} --overwrite
+done
 
 # Deploy OVN-Kubernetes using Helm
 cd ${DIR}/ovn-kubernetes
@@ -97,4 +91,3 @@ helm install ovn-kubernetes . -f ${VALUES_FILE} \
     --set k8sAPIServer="https://$(kubectl get pods -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].status.hostIP}'):6443" \
     --set global.image.repository=${IMG_PREFIX} \
     --set global.image.tag=${TAG}
-
