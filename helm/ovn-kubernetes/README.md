@@ -91,16 +91,16 @@ networking:
 
 This chart does not use a `values.yaml` by default. You must specify a values file during installation.
 
-- Run `helm install` with the appropriate `k8sAPIServer`, `ovnkube-identity.replicas`, image repo and tag
+- Run `helm install` with the appropriate `k8sAPIServer`, image repo and tag
 ```
 # cd helm/ovn-kubernetes
-# helm install ovn-kubernetes . -f values-no-ic.yaml --set k8sAPIServer="https://$(kubectl get pods -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].status.hostIP}'):6443" --set ovnkube-identity.replicas=$(kubectl get node -l node-role.kubernetes.io/control-plane --no-headers | wc -l) --set global.image.repository=ghcr.io/ovn-kubernetes/ovn-kubernetes/ovn-kube-ubuntu --set global.image.tag=master
+# helm install ovn-kubernetes . -f values-single-node-zone.yaml --set k8sAPIServer="https://$(kubectl get pods -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].status.hostIP}'):6443" --set global.image.repository=ghcr.io/ovn-kubernetes/ovn-kubernetes/ovn-kube-ubuntu --set global.image.tag=master
 ```
 
 ## Alternative Configurations
 
-To deploy ovn-kubernetes in interconnect mode, use `-f values-single-node-zone.yaml` instead of `-f values-no-ic.yaml`.
-Additionally, you must set the zone annotation on each node before deploying.
+To deploy ovn-kubernetes with multi-node zones, use `-f values-multi-node-zone.yaml` instead.
+You must set the zone annotation on each node before deploying.
 
 Here is an example of how to set the annotation in a Kind cluster:
 
@@ -199,22 +199,13 @@ false
 			<td>Whether or not to use Admin Network Policy CRD feature with ovn-kubernetes</td>
 		</tr>
 		<tr>
-			<td>global.enableCompactMode</td>
-			<td>bool</td>
-			<td><pre lang="json">
-false
-</pre>
-</td>
-			<td>Indicate if ovnkube run master and node in one process</td>
-		</tr>
-		<tr>
 			<td>global.enableConfigDuration</td>
 			<td>string</td>
 			<td><pre lang="json">
 ""
 </pre>
 </td>
-			<td>Enables monitoring OVN-Kubernetes master and OVN configuration duration</td>
+			<td>Enables monitoring OVN-Kubernetes control plane and OVN configuration duration</td>
 		</tr>
 		<tr>
 			<td>global.enableDNSNameResolver</td>
@@ -699,16 +690,6 @@ false
 </td>
 			<td>number of ovnube-identity pods, co-located with kube-apiserver process, so need to be the same number of control plane nodes</td>
 		</tr>
-		<tr>
-			<td>ovnkube-master.replicas</td>
-			<td>int</td>
-			<td><pre lang="json">
-1
-</pre>
-</td>
-			<td>number of ovnkube-master pods</td>
-		</tr>
-		<tr>
 			<td>podNetwork</td>
 			<td>string</td>
 			<td><pre lang="json">
@@ -742,7 +723,6 @@ false
 {
   "ovn-ipsec": false,
   "ovnkube-control-plane": false,
-  "ovnkube-db-raft": false,
   "ovnkube-node-dpu": false,
   "ovnkube-node-dpu-host": false,
   "ovnkube-single-node-zone": false,
@@ -754,4 +734,3 @@ false
 		</tr>
 	</tbody>
 </table>
-

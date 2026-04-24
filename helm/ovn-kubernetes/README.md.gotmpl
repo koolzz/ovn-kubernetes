@@ -95,13 +95,13 @@ networking:
 - Run `helm install` with propery `k8sAPIServer` image repo and tag
 ```
 # cd helm/ovn-kubernetes
-# helm install ovn-kubernetes . -f values.yaml --set k8sAPIServer="https://$(kubectl get pods -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].status.hostIP}'):6443" --set global.image.repository=ghcr.io/ovn-kubernetes/ovn-kubernetes/ovn-kube-ubuntu --set global.image.tag=master
+# helm install ovn-kubernetes . -f values-single-node-zone.yaml --set k8sAPIServer="https://$(kubectl get pods -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].status.hostIP}'):6443" --set global.image.repository=ghcr.io/ovn-kubernetes/ovn-kubernetes/ovn-kube-ubuntu --set global.image.tag=master
 ```
 
 ## Notes:
 - Only following scenarios were tested with Kind cluster
-  - ovs-node + ovnkube-node + ovnkube-db + ovnkube-master, with/without ovnkube-identity
-  - ovs-node + ovnkube-node + ovnkube-db-raft + ovnkube-master, with/without ovnkube-identity
+  - ovs-node + ovnkube-node + ovnkube-control-plane + ovnkube-identity
+  - ovs-node + ovnkube-node + ovnkube-control-plane + ovnkube-zone-controller
 
 Following section describes the meaning of the values.
 {{ template "chart.valuesSectionHtml" . }}
