@@ -1,14 +1,12 @@
-> **⚠️ The `./daemonset.sh` step in this guide is out of date.**
+> **⚠️ Direct manifest deployment from this guide is out of date.**
 >
-> OVN-Kubernetes no longer ships the Jinja2 manifest templates that
-> `daemonset.sh` renders — the supported install path is the Helm chart. The
-> prerequisite steps below (VM setup, `kubeadm init`, container runtime
-> install, etc.) are still accurate; only the section that invokes
-> `./daemonset.sh` to deploy OVN-Kubernetes itself is stale.
+> The supported install path is the Helm chart. The prerequisite steps below
+> (VM setup, `kubeadm init`, container runtime install, etc.) are still
+> accurate.
 >
 > To deploy OVN-Kubernetes on the cluster you've built with this guide, follow
 > [Launching OVN-Kubernetes with Helm](launching-ovn-kubernetes-with-helm.md)
-> instead of the `./daemonset.sh` section.
+> instead of direct manifests.
 
 The following is a walkthrough for an installation in an environment with 4 virtual machines, and a cluster deployed with `kubeadm`. This shall serve as a guide for people who are curious enough to deploy OVN-Kubernetes on a manually created cluster and to play around with the components. 
 
@@ -465,61 +463,26 @@ buildah bud -t $OVN_IMAGE -f Dockerfile.fedora .
 podman push $OVN_IMAGE
 ~~~
 
-Next, run:
+Deploy OVN-Kubernetes with the Helm chart:
+
 ~~~
-OVN_IMAGE=192.168.123.254:5000/ovn-daemonset-fedora:latest
-MASTER_IP=192.168.123.1
-NET_CIDR="172.16.0.0/16/24"
-SVC_CIDR="172.17.0.0/16"
-./daemonset.sh --image=${OVN_IMAGE} \
-    --net-cidr="${NET_CIDR}" --svc-cidr="${SVC_CIDR}" \
-    --gateway-mode="local" \
-    --k8s-apiserver=https://${MASTER_IP}:6443
+cd $HOME/work/src/github.com/ovn-kubernetes/ovn-kubernetes/helm/ovn-kubernetes
+helm install ovn-kubernetes . \
+    -f values-single-node-zone.yaml \
+    --set k8sAPIServer=https://${MASTER_IP}:6443 \
+    --set global.image.repository=192.168.123.254:5000/ovn-daemonset-fedora \
+    --set global.image.tag=latest
 ~~~
 
-You might also have to work around an issue where br-int is added by OVN, but the necessary files in /var/run/openvswitch are not created until Open vSwitch is restarted - [see here for more details](#issues-workarounds). This only happens on the master, so let's pre-create `br-int` there:
-~~~
-ovs-vsctl add-br br-int
-~~~
+The Helm chart does not remove kube-proxy. Since the `kubeadm init` command
+above installs kube-proxy by default, delete the kube-proxy DaemonSet:
 
-Now, set up ovnkube:
-~~~
-# set up the namespace
-kubectl apply -f $HOME/work/src/github.com/ovn-kubernetes/ovn-kubernetes/dist/yaml/ovn-setup.yaml
-# set up the database pods - wait until the pods are up and running before progressing to the next command:
-kubectl apply -f $HOME/work/src/github.com/ovn-kubernetes/ovn-kubernetes/dist/yaml/ovnkube-db.yaml
-# set up the master pods - wait until the pods are up and running before progressing to the next command:
-kubectl apply -f $HOME/work/src/github.com/ovn-kubernetes/ovn-kubernetes/dist/yaml/ovnkube-master.yaml
-# set up the ovnkube-node pods - wait until the pods are up and running before progressing to the next command:
-kubectl apply -f $HOME/work/src/github.com/ovn-kubernetes/ovn-kubernetes/dist/yaml/ovnkube-node.yaml
-~~~
-
-Once all OVN related pods are up, you should see that the CoreDNS pods have started as well and they should be in the correct network.
-~~~
-[root@node1 images]# kubectl get pods -A -o wide | grep coredns
-kube-system      coredns-78fcd69978-ms969         1/1     Running   0          29s     172.16.0.6        node1   <none>           <none>
-kube-system      coredns-78fcd69978-w6k2z         1/1     Running   0          36s     172.16.0.5        node1   <none>           <none>
-~~~
-
-Finally, delete the kube-proxy DaemonSet:
 ~~~
 kubectl delete ds -n kube-system kube-proxy
 ~~~
 
-You should now see the following when listing all pods:
-~~~
-[root@node1 ~]# kubectl get pods -A -o wide
-NAMESPACE        NAME                             READY   STATUS    RESTARTS   AGE     IP                NODE    NOMINATED NODE   READINESS GATES
-kube-system      coredns-78fcd69978-rhjgh         1/1     Running   0          10s     172.16.0.4        node1   <none>           <none>
-kube-system      coredns-78fcd69978-xcxnx         1/1     Running   0          17s     172.16.0.3        node1   <none>           <none>
-kube-system      etcd-node1                       1/1     Running   1          74m     192.168.122.205   node1   <none>           <none>
-kube-system      kube-apiserver-node1             1/1     Running   1          74m     192.168.122.205   node1   <none>           <none>
-kube-system      kube-controller-manager-node1    1/1     Running   1          74m     192.168.122.205   node1   <none>           <none>
-kube-system      kube-scheduler-node1             1/1     Running   1          74m     192.168.122.205   node1   <none>           <none>
-ovn-kubernetes   ovnkube-db-7767c6b7c5-25drn      2/2     Running   2          11m     192.168.122.205   node1   <none>           <none>
-ovn-kubernetes   ovnkube-master-775d45fd5-mzkcb   3/3     Running   3          10m     192.168.122.205   node1   <none>           <none>
-ovn-kubernetes   ovnkube-node-xmgrj               3/3     Running   3          8m49s   192.168.122.205   node1   <none>           <none>
-~~~
+Follow [Launching OVN-Kubernetes with Helm](launching-ovn-kubernetes-with-helm.md)
+for the current deployment values, validation steps, and uninstall instructions.
 
 ### Verifying the deployment 
 
@@ -613,12 +576,9 @@ Complete!
 
 ### Uninstalling OVN-Kubernetes
 
-In order to uninstall OVN kubernetes:
+If you deployed OVN-Kubernetes with Helm as described above, uninstall it with:
 ~~~
-kubectl delete -f $HOME/work/src/github.com/ovn-kubernetes/ovn-kubernetes/dist/yaml/ovnkube-node.yaml
-kubectl delete -f $HOME/work/src/github.com/ovn-kubernetes/ovn-kubernetes/dist/yaml/ovnkube-master.yaml
-kubectl delete -f $HOME/work/src/github.com/ovn-kubernetes/ovn-kubernetes/dist/yaml/ovnkube-db.yaml
-kubectl delete -f $HOME/work/src/github.com/ovn-kubernetes/ovn-kubernetes/dist/yaml/ovn-setup.yaml
+helm uninstall ovn-kubernetes
 ~~~
 
 ### Issues / workarounds:
@@ -655,4 +615,3 @@ systemctl restart openvswitch
 systemctl restart NetworkManager
 nmcli conn up ovs-if-${IF2}
 ~~~
-
