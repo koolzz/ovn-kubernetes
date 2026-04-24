@@ -74,51 +74,19 @@ sudo ovs-appctl -t /var/run/openvswitch/ovnsb_db.ctl \
     cluster/status OVN_Southbound
 ```
 
-## ovnkube master HA setup
+## ovnkube control plane HA setup
 
-ovnkube master has 2 main components - cluster-manager and ovnkube-controller.
+The ovnkube control plane has 2 main components - cluster-manager and
+ovnkube-controller.
 
-Starting ovnkube with '-init-master', runs both the components.  It is also possible
-to run these components individually by starting 2 ovnkube's one with '-init-cluster-manager'
-and the other with '-init-ovnkube-controller'.
-
-On the master nodes, we can either
-   * start ovnkube with '-init-master'
-     This should be a deployment running on master nodes. Eg.
-
-IP1="$MASTER1"
-IP2="$MASTER2"
-IP3="$MASTER3"
-
-ovn_nb="tcp:$IP1:6641,tcp:$IP2:6641,tcp:$IP3:6641"
-ovn_sb="tcp:$IP1:6642,tcp:$IP2:6642,tcp:$IP3:6642"
-
-nohup sudo ovnkube -k8s-kubeconfig kubeconfig.yaml \
- -loglevel=4 \
- -k8s-apiserver="http://$K8S_APISERVER_IP:8080" \
- -logfile="/var/log/openvswitch/ovnkube.log" \
- -init-master="$NODENAME" -cluster-subnets="$CLUSTER_IP_SUBNET" \
- -init-node="$NODENAME" \
- -k8s-service-cidr="$SERVICE_IP_SUBNET" \
- -k8s-token="$TOKEN" \
- -nodeport \
- -nb-address="${ovn_nb}" \
- -sb-address="${ovn_sb}"  2>&1 &
-
- * start 'ovnkube -init-cluster-manager' and 'ovnkube -init-ovnkube-controller'
-   This should be a deployment with these 2 as containers
+Start 'ovnkube -init-cluster-manager' and 'ovnkube -init-ovnkube-controller'
+as separate processes. This should be a deployment with these 2 as containers.
 
 Eg.
 
+Run ovnkube-controller with access to the OVN databases:
 
-ovnkube master supports running in 3 modes.
-init-master mode, init-cluster-manager mode or init-ovnkube-controller
-mode.  If ovnkube is run with "-init-master" mode, then there is
-no need to run the other modes because master mode enables both cluster-manager
-and ovnkube-controller.  If the user desires to run cluster-manager
-and ovnkube-controller separately, then it is possible to do
-so by running 
-
+```
 nohup sudo ovnkube -k8s-kubeconfig kubeconfig.yaml \
  -loglevel=4 \
  -k8s-apiserver="http://$K8S_APISERVER_IP:8080" \
@@ -130,16 +98,19 @@ nohup sudo ovnkube -k8s-kubeconfig kubeconfig.yaml \
  -nodeport \
  -nb-address="${ovn_nb}" \
  -sb-address="${ovn_sb}"  2>&1 &
+```
 
+Run cluster-manager separately:
+
+```
 nohup sudo ovnkube -k8s-kubeconfig kubeconfig.yaml \
  -loglevel=4 \
  -k8s-apiserver="http://$K8S_APISERVER_IP:8080" \
  -logfile="/var/log/openvswitch/ovnkube.log" \
  -init-cluster-manager="$NODENAME" -cluster-subnets="$CLUSTER_IP_SUBNET" \
- -init-node="$NODENAME" \
  -k8s-service-cidr="$SERVICE_IP_SUBNET" \
- -k8s-token="$TOKEN" \
- -nodeport  2>&1 &
+ -k8s-token="$TOKEN" 2>&1 &
+```
 
 ## start ovn-northd
 
