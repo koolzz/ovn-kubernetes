@@ -10,7 +10,6 @@ import (
 	"k8s.io/klog/v2"
 
 	ovncnitypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/cni/types"
-	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/networkmanager"
 	ovntypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
@@ -86,12 +85,11 @@ func (sncm *userDefinedNetworkClusterManager) isTopologyManaged(nInfo util.NetIn
 		// we need to allocate subnets to each node regardless of configuration
 		return true
 	case ovntypes.Layer2Topology:
-		// With interconnect enabled, pod IPs and tunnel IDs are allocated by
-		// cluster-manager.
-		return config.OVNKubernetesFeature.EnableInterconnect
+		// pod IPs and tunnel IDs are allocated by cluster-manager
+		return true
 	case ovntypes.LocalnetTopology:
-		// With interconnect enabled, pod IPs are allocated by cluster-manager.
-		return config.OVNKubernetesFeature.EnableInterconnect && len(nInfo.Subnets()) > 0
+		// pod IPs are allocated by cluster-manager if there is IPAM
+		return len(nInfo.Subnets()) > 0
 	}
 	return false
 }
