@@ -1,7 +1,7 @@
-# OVN central database High-availability
+# OVN database High-availability
 
-OVN architecture has two central databases that can be clustered.
-The databases are OVN_Northbound and OVN_Southbound.  This document
+OVN architecture has two databases that can be clustered.
+The databases are OVN_Northbound and OVN_Southbound. This document
 explains how to cluster them and start various daemons for the
 ovn-kubernetes integration.  You will ideally need at least 3 masters
 for a HA cluster. (You will need a miniumum of OVS/OVN 2.9.2
