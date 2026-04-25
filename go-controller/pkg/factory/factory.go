@@ -527,14 +527,6 @@ func NewOVNKubeControllerWatchFactory(ovnClientset *util.OVNKubeControllerClient
 			return nil, err
 		}
 
-		if config.OVNKubernetesFeature.EnablePersistentIPs && !config.OVNKubernetesFeature.EnableInterconnect {
-			wf.ipamClaimsFactory = ipamclaimsfactory.NewSharedInformerFactory(ovnClientset.IPAMClaimsClient, resyncInterval)
-			wf.informers[IPAMClaimsType], err = newQueuedInformer(eventQueueSize, IPAMClaimsType,
-				wf.ipamClaimsFactory.K8s().V1alpha1().IPAMClaims().Informer(), wf.stopChan, minNumEventQueues)
-			if err != nil {
-				return nil, err
-			}
-		}
 	}
 
 	if util.IsNetworkSegmentationSupportEnabled() {
@@ -1091,23 +1083,21 @@ func NewClusterManagerWatchFactory(ovnClientset *util.OVNClusterManagerClientset
 			return nil, err
 		}
 
-		if config.OVNKubernetesFeature.EnableInterconnect {
-			wf.informers[PodType], err = newQueuedInformer(eventQueueSize,
-				PodType, wf.iFactory.Core().V1().Pods().Informer(),
-				wf.stopChan, defaultNumEventQueues)
+		wf.informers[PodType], err = newQueuedInformer(eventQueueSize,
+			PodType, wf.iFactory.Core().V1().Pods().Informer(),
+			wf.stopChan, defaultNumEventQueues)
+		if err != nil {
+			return nil, err
+		}
+
+		if config.OVNKubernetesFeature.EnablePersistentIPs {
+			wf.ipamClaimsFactory = ipamclaimsfactory.NewSharedInformerFactory(ovnClientset.IPAMClaimsClient, resyncInterval)
+			wf.informers[IPAMClaimsType], err = newQueuedInformer(eventQueueSize,
+				IPAMClaimsType,
+				wf.ipamClaimsFactory.K8s().V1alpha1().IPAMClaims().Informer(),
+				wf.stopChan, minNumEventQueues)
 			if err != nil {
 				return nil, err
-			}
-
-			if config.OVNKubernetesFeature.EnablePersistentIPs {
-				wf.ipamClaimsFactory = ipamclaimsfactory.NewSharedInformerFactory(ovnClientset.IPAMClaimsClient, resyncInterval)
-				wf.informers[IPAMClaimsType], err = newQueuedInformer(eventQueueSize,
-					IPAMClaimsType,
-					wf.ipamClaimsFactory.K8s().V1alpha1().IPAMClaims().Informer(),
-					wf.stopChan, minNumEventQueues)
-				if err != nil {
-					return nil, err
-				}
 			}
 		}
 	}
