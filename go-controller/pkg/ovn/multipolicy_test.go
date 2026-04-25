@@ -333,14 +333,12 @@ var _ = ginkgo.Describe("OVN MultiNetworkPolicy Operations", func() {
 		)
 		var err error
 		if watchNodes {
-			if config.OVNKubernetesFeature.EnableInterconnect {
-				// add the transit switch port bindings on behalf of ovn-controller
-				// before WatchNodes so it does not synchrounously wait for them
-				for _, node := range nodes {
-					transistSwitchPortName := ovntypes.TransitSwitchToRouterPrefix + node.Name
-					err := libovsdb.CreateTransitSwitchPortBindings(fakeOvn.sbClient, ovntypes.TransitSwitch, transistSwitchPortName)
-					gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				}
+			// add the transit switch port bindings on behalf of ovn-controller
+			// before WatchNodes so it does not synchrounously wait for them
+			for _, node := range nodes {
+				transistSwitchPortName := ovntypes.TransitSwitchToRouterPrefix + node.Name
+				err := libovsdb.CreateTransitSwitchPortBindings(fakeOvn.sbClient, ovntypes.TransitSwitch, transistSwitchPortName)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			}
 			startDefaultNodeController(fakeOvn.controller)
 		}
@@ -368,7 +366,7 @@ var _ = ginkgo.Describe("OVN MultiNetworkPolicy Operations", func() {
 
 		for _, ocInfo := range fakeOvn.userDefinedNetworkControllers {
 			if watchNodes {
-				if ocInfo.bnc.TopologyType() == ovntypes.Layer3Topology && config.OVNKubernetesFeature.EnableInterconnect {
+				if ocInfo.bnc.TopologyType() == ovntypes.Layer3Topology {
 					// add the transit switch port bindings on behalf of ovn-controller
 					// before registering the node handler so it does not synchronously wait for them
 					for _, node := range nodes {
@@ -574,7 +572,6 @@ var _ = ginkgo.Describe("OVN MultiNetworkPolicy Operations", func() {
 
 					// flag node as remote and set IC specific annotations
 					if remote {
-						config.OVNKubernetesFeature.EnableInterconnect = true
 						node.Annotations["k8s.ovn.org/zone-name"] = "remote"
 						node.Annotations, err = util.UpdateNetworkIDAnnotation(node.Annotations, ovntypes.DefaultNetworkName, 0)
 						gomega.Expect(err).NotTo(gomega.HaveOccurred())

@@ -85,7 +85,6 @@ func init() {
 	config.IPv6Mode = false
 	config.OVNKubernetesFeature.EnableNetworkQoS = true
 	config.OVNKubernetesFeature.EnableMultiNetwork = true
-	config.OVNKubernetesFeature.EnableInterconnect = false // set via tableEntrySetup
 }
 
 var (
@@ -117,9 +116,7 @@ func TestNetworkQoS(t *testing.T) {
 	RunSpecs(t, "NetworkQoS Controller")
 }
 
-func tableEntrySetup(enableInterconnect bool) {
-	config.OVNKubernetesFeature.EnableInterconnect = enableInterconnect
-
+func tableEntrySetup() {
 	ns0 := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: nqosNamespace,
@@ -309,13 +306,13 @@ func tableEntrySetup(enableInterconnect bool) {
 	fakeNQoSClient = ovnClientset.NetworkQoSClient
 	initEnv(ovnClientset, initialDB)
 	// init controller for default network
-	initNetworkQoSController(&util.DefaultNetInfo{}, nil, defaultAddrsetFactory, defaultControllerName, enableInterconnect)
+	initNetworkQoSController(&util.DefaultNetInfo{}, nil, defaultAddrsetFactory, defaultControllerName)
 	// init controller for stream nad
 	streamImmutableNadInfo, err := util.ParseNADInfo(nad)
 	Expect(err).NotTo(HaveOccurred())
 	streamNadInfo := util.NewMutableNetInfo(streamImmutableNadInfo)
 	streamNadInfo.AddNADs("default/stream")
-	initNetworkQoSController(streamNadInfo, []string{"default/stream"}, streamAddrsetFactory, streamControllerName, enableInterconnect)
+	initNetworkQoSController(streamNadInfo, []string{"default/stream"}, streamAddrsetFactory, streamControllerName)
 }
 
 var _ = AfterEach(func() {
@@ -328,11 +325,11 @@ var _ = AfterEach(func() {
 
 var _ = Describe("NetworkQoS Controller", func() {
 
-	var _ = Context("With different interconnect configurations", func() {
+	var _ = Context("With interconnect enabled", func() {
 
 		DescribeTable("When starting controller with NetworkQoS, Pod and Node objects",
-			func(enableInterconnect bool) {
-				tableEntrySetup(enableInterconnect)
+			func() {
+				tableEntrySetup()
 
 				By("creates address sets for source and destination pod selectors")
 				{
@@ -802,7 +799,7 @@ var _ = Describe("NetworkQoS Controller", func() {
 					Expect(err).NotTo(HaveOccurred())
 					localnetNadInfo := util.NewMutableNetInfo(localnetImmutableNadInfo)
 					localnetNadInfo.AddNADs("default/netwk1")
-					ctrl := initNetworkQoSController(localnetNadInfo, []string{"default/netwk1"}, addressset.NewFakeAddressSetFactory("netwk1-controller"), "netwk1-controller", enableInterconnect)
+					ctrl := initNetworkQoSController(localnetNadInfo, []string{"default/netwk1"}, addressset.NewFakeAddressSetFactory("netwk1-controller"), "netwk1-controller")
 					lsName := ctrl.getLogicalSwitchName("dummy")
 					Expect(lsName).To(Equal("netwk1_ovn_localnet_switch"))
 				}
@@ -814,7 +811,7 @@ var _ = Describe("NetworkQoS Controller", func() {
 					Expect(err).NotTo(HaveOccurred())
 					layer2NadInfo := util.NewMutableNetInfo(layer2ImmutableNadInfo)
 					layer2NadInfo.AddNADs("default/netwk2")
-					ctrl := initNetworkQoSController(layer2NadInfo, []string{"default/netwk2"}, addressset.NewFakeAddressSetFactory("netwk2-controller"), "netwk2-controller", enableInterconnect)
+					ctrl := initNetworkQoSController(layer2NadInfo, []string{"default/netwk2"}, addressset.NewFakeAddressSetFactory("netwk2-controller"), "netwk2-controller")
 					lsName := ctrl.getLogicalSwitchName("dummy")
 					Expect(lsName).To(Equal("netwk2_ovn_layer2_switch"))
 				}
@@ -889,7 +886,7 @@ var _ = Describe("NetworkQoS Controller", func() {
 
 					// Wrap the NetInfo with our custom implementation that returns true for IsPrimaryNetwork()
 					primNetWrapper := &primaryNetInfoWrapper{NetInfo: primaryNadInfo}
-					initNetworkQoSController(primNetWrapper, nil, addressset.NewFakeAddressSetFactory("primary-controller"), "primary-controller", enableInterconnect)
+					initNetworkQoSController(primNetWrapper, nil, addressset.NewFakeAddressSetFactory("primary-controller"), "primary-controller")
 
 					// Ensure app1 namespace exists before testing primary networks
 					ns, err := fakeKubeClient.CoreV1().Namespaces().Get(context.TODO(), app1Namespace, metav1.GetOptions{})
@@ -1012,7 +1009,7 @@ var _ = Describe("NetworkQoS Controller", func() {
 
 					// Wrap the NetInfo with our custom implementation that returns true for IsUserDefinedNetwork()
 					secNetWrapper := &secondaryNetInfoWrapper{NetInfo: secondaryNadInfo}
-					initNetworkQoSController(secNetWrapper, []string{"default/secondary"}, addressset.NewFakeAddressSetFactory("secondary-controller"), "secondary-controller", enableInterconnect)
+					initNetworkQoSController(secNetWrapper, []string{"default/secondary"}, addressset.NewFakeAddressSetFactory("secondary-controller"), "secondary-controller")
 
 					// Ensure app3 namespace exists before testing secondary networks
 					ns, err := fakeKubeClient.CoreV1().Namespaces().Get(context.TODO(), app3Namespace, metav1.GetOptions{})
@@ -1069,8 +1066,7 @@ var _ = Describe("NetworkQoS Controller", func() {
 					Expect(err).NotTo(HaveOccurred())
 				}
 			},
-			Entry("Interconnect Disabled", false),
-			Entry("Interconnect Enabled", true),
+			Entry("Interconnect enabled"),
 		)
 	})
 })
@@ -1204,7 +1200,7 @@ func initEnv(clientset *util.OVNClientset, initialDB *libovsdbtest.TestSetup) {
 	streamAddrsetFactory = addressset.NewFakeAddressSetFactory("stream-network-controller")
 }
 
-func initNetworkQoSController(netInfo util.NetInfo, nadKeys []string, addrsetFactory addressset.AddressSetFactory, controllerName string, enableInterconnect bool) *Controller {
+func initNetworkQoSController(netInfo util.NetInfo, nadKeys []string, addrsetFactory addressset.AddressSetFactory, controllerName string) *Controller {
 	var networkMgr networkmanager.Interface
 	if netInfo.IsUserDefinedNetwork() {
 		if len(nadKeys) == 0 {
@@ -1232,7 +1228,7 @@ func initNetworkQoSController(netInfo util.NetInfo, nadKeys []string, addrsetFac
 		networkMgr,
 		addrsetFactory,
 		func(pod *corev1.Pod) bool {
-			return pod.Spec.NodeName == "node1" || !enableInterconnect
+			return pod.Spec.NodeName == "node1"
 		}, "node1")
 	Expect(err).NotTo(HaveOccurred())
 	err = watchFactory.Start()

@@ -1789,7 +1789,6 @@ var _ = ginkgo.Describe("Default network controller operations", func() {
 		app.Action = func(ctx *cli.Context) error {
 			_, err := config.InitConfig(ctx, nil, nil)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
-			config.OVNKubernetesFeature.EnableInterconnect = true
 			config.Kubernetes.HostNetworkNamespace = "ovn-host-network"
 
 			// add the transit switch port bindings on behalf of ovn-northd so that
