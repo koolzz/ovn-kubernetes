@@ -39,3 +39,11 @@ func GetOpenvSwitch(ovsClient libovsdbclient.Client) (*vswitchd.OpenvSwitch, err
 func UpdateOpenvSwitchExternalIDs(ovsClient libovsdbclient.Client, kv map[string]string) error {
 	return libovsdbops.UpdateOpenvSwitchExternalIDs(ovsClient, kv)
 }
+
+// RemoveOpenvSwitchExternalIDs removes the given keys from the Open_vSwitch
+// root row's external_ids. Keys not present and a missing root row are both
+// no-ops, matching the semantics of `ovs-vsctl --if-exists remove
+// Open_vSwitch . external_ids <key>`.
+func RemoveOpenvSwitchExternalIDs(ovsClient libovsdbclient.Client, keys ...string) error {
+	return libovsdbops.RemoveOpenvSwitchExternalIDs(ovsClient, keys...)
+}
