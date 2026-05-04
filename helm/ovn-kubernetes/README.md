@@ -62,10 +62,6 @@ CNI features, this can be done by editing `tags` section in values.yaml file.
   ```
   contrib/kind-helm.sh -ic
   ```
-- Add `-npz` (node-per-zone) to set up cluster with multi-node-zone interconnect
-  ```
-  contrib/kind-helm.sh -ic -wk 3 -npz 2
-  ```
 
 ## Manual steps:
 
@@ -95,19 +91,6 @@ This chart does not use a `values.yaml` by default. You must specify a values fi
 ```
 # cd helm/ovn-kubernetes
 # helm install ovn-kubernetes . -f values-single-node-zone.yaml --set k8sAPIServer="https://$(kubectl get pods -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].status.hostIP}'):6443" --set global.image.repository=ghcr.io/ovn-kubernetes/ovn-kubernetes/ovn-kube-ubuntu --set global.image.tag=master
-```
-
-## Alternative Configurations
-
-To deploy ovn-kubernetes with multi-node zones, use `-f values-multi-node-zone.yaml` instead.
-You must set the zone annotation on each node before deploying.
-
-Here is an example of how to set the annotation in a Kind cluster:
-
-```
-for n in $(kind get nodes --name "${kind_cluster_name}"); do
-  kubectl label node "${n}" k8s.ovn.org/zone-name=${n} --overwrite
-done
 ```
 
 Following section describes the meaning of the values.
@@ -713,11 +696,8 @@ false
 			<td><pre lang="json">
 {
   "ovn-ipsec": false,
-  "ovnkube-control-plane": false,
   "ovnkube-node-dpu": false,
-  "ovnkube-node-dpu-host": false,
-  "ovnkube-single-node-zone": false,
-  "ovnkube-zone-controller": false
+  "ovnkube-node-dpu-host": false
 }
 </pre>
 </td>

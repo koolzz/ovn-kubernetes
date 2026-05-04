@@ -60,10 +60,6 @@ CNI features, this can be done by editing `tags` section in values.yaml file.
   ```
   contrib/kind-helm.sh -ic
   ```
-- Add `-npz` (node-per-zone) to set up cluster with multi-node-zone interconnect 
-  ```
-  contrib/kind-helm.sh -ic -wk 3 -npz 2
-  ```
 
 ## Manual steps:
 - Disable IPv6 of `kind` docker network, otherwise ovnkube-node will fail to start
@@ -101,7 +97,6 @@ networking:
 ## Notes:
 - Only following scenarios were tested with Kind cluster
   - ovs-node + ovnkube-node + ovnkube-control-plane + ovnkube-identity
-  - ovs-node + ovnkube-node + ovnkube-control-plane + ovnkube-zone-controller
 
 Following section describes the meaning of the values.
 {{ template "chart.valuesSectionHtml" . }}
