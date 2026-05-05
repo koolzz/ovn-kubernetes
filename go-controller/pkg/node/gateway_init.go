@@ -520,12 +520,18 @@ func (nc *DefaultNodeNetworkController) initGatewayDPUHost() error {
 // daemonset deletion. Best-effort: OVS-side cleanup is skipped on DPU-host
 // (no OVS to clean) or when the OVSDB client cannot be created; iptables and
 // nftables cleanup always runs.
-func CleanupClusterNode(stopChan <-chan struct{}, name string) error {
+func CleanupClusterNode(name string) error {
 	klog.V(5).Infof("Cleaning up gateway resources on node: %q", name)
 
 	var ovsClient libovsdbclient.Client
 	if config.IsModeDPU() || config.IsModeFull() {
-		c, err := libovsdb.NewOVSClient(stopChan)
+		// NewOVSClient closes its client when the stop channel fires; use a
+		// dedicated never-shared channel so an in-flight cleanup transaction
+		// can't be torn down mid-operation. Close on return so the libovsdb
+		// lifecycle goroutine exits cleanly.
+		cleanupStopCh := make(chan struct{})
+		defer close(cleanupStopCh)
+		c, err := libovsdb.NewOVSClient(cleanupStopCh)
 		if err != nil {
 			klog.Warningf("Skipping OVS-side cleanup: failed to initialize libovsdb vswitchd client: %v", err)
 		} else {
@@ -536,17 +542,20 @@ func CleanupClusterNode(stopChan <-chan struct{}, name string) error {
 	if ovsClient != nil {
 		var err error
 		if config.Gateway.Mode == config.GatewayModeLocal || config.Gateway.Mode == config.GatewayModeShared {
-			err = cleanupLocalnetGateway(ovsClient, types.LocalNetworkName)
-			if err != nil {
-				klog.Errorf("Failed to cleanup Localnet Gateway, error: %v", err)
+			if localErr := cleanupLocalnetGateway(ovsClient, types.LocalNetworkName); localErr != nil {
+				klog.Errorf("Failed to cleanup Localnet Gateway, error: %v", localErr)
+				err = localErr
 			}
-			err = cleanupSharedGateway(ovsClient)
-		}
-		if err != nil {
-			klog.Errorf("Failed to cleanup Gateway, error: %v", err)
+			if sharedErr := cleanupSharedGateway(ovsClient); sharedErr != nil {
+				klog.Errorf("Failed to cleanup Gateway, error: %v", sharedErr)
+				err = sharedErr
+			}
 		}
 
-		if config.IsModeDPU() || config.IsModeFull() {
+		// Only strip ovn-bridge-mappings once gateway cleanup has fully
+		// succeeded — otherwise we leave bridges/flows behind without the
+		// external_ids that would let a retry re-attach them.
+		if err == nil && (config.IsModeDPU() || config.IsModeFull()) {
 			if err := ovsops.RemoveOpenvSwitchExternalIDs(ovsClient, "ovn-bridge-mappings"); err != nil {
 				klog.Errorf("Failed to delete ovn-bridge-mappings: %v", err)
 			}
