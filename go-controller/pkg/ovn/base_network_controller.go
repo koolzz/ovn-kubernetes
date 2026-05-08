@@ -117,6 +117,19 @@ type BaseNetworkController struct {
 	// network registers a handler in Phase 3a; UDNs follow in 3b.
 	nsReconciler *nscontroller.NamespaceController
 
+	// nsHandlerSelf is a back-reference to the concrete controller
+	// (DefaultNetworkController or *BaseUserDefinedNetworkController-
+	// embedding type) so that the legacy WatchNamespaces() entry point
+	// on the base type can register itself with the shared
+	// NamespaceController. Set by each concrete controller's
+	// constructor after the embedded base is built. Production paths
+	// (each controller's run()) call registerNamespaceReconciler
+	// directly with the concrete handler and don't rely on this
+	// back-reference; it exists solely for transitional test
+	// compatibility (Phase 4.0). Phase 4.1 removes WatchNamespaces and
+	// this field together.
+	nsHandlerSelf nscontroller.NamespaceHandler
+
 	// pod events factory handler
 	podHandler *factory.Handler
 	// namespace events factory Handler

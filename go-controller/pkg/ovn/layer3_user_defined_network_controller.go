@@ -259,6 +259,10 @@ func NewLayer3UserDefinedNetworkController(
 		gatewayManagers:             sync.Map{},
 		eIPController:               eIPController,
 	}
+	// Back-reference for the legacy WatchNamespaces test entry point;
+	// production paths register through the shared NamespaceController
+	// directly. See BaseNetworkController.nsHandlerSelf for the rationale.
+	oc.nsHandlerSelf = &oc.BaseUserDefinedNetworkController
 
 	if oc.IsPrimaryNetwork() {
 		oc.onLogicalPortCacheAdd = func(pod *corev1.Pod, _ string) {

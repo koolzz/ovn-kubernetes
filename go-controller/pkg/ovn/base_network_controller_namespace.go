@@ -15,6 +15,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	libovsdbutil "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/util"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
@@ -61,25 +62,34 @@ func (bnc *BaseNetworkController) shouldWatchNamespaces() bool {
 		bnc.IsUserDefinedNetwork() && util.IsMultiNetworkPoliciesSupportEnabled()
 }
 
-// WatchNamespaces starts the watching of namespace resource and calls
-// back the appropriate handler logic
+// WatchNamespaces is a transitional entry point retained for tests
+// (Phase 4.0): production paths call registerNamespaceReconciler
+// directly from each controller's run(). This routes the call through
+// the shared NamespaceController via the controller's back-reference
+// to its concrete NamespaceHandler. Idempotent — bnc.namespaceHandler
+// doubles as the registered-already sentinel during the migration.
+// Phase 4.1 removes both WatchNamespaces and the back-reference field.
 func (bnc *BaseNetworkController) WatchNamespaces() error {
 	if !bnc.shouldWatchNamespaces() {
 		klog.Infof("Ignoring namespaces events for network: %s", bnc.GetNetworkName())
 		return nil
 	}
-
 	if bnc.namespaceHandler != nil {
 		return nil
 	}
-
-	handler, err := bnc.retryNamespaces.WatchResource()
-	if err != nil {
+	if bnc.nsReconciler == nil || bnc.nsHandlerSelf == nil {
+		return nil
+	}
+	if err := bnc.nsReconciler.Start(); err != nil {
 		return err
 	}
-	bnc.namespaceHandler = handler
-	return err
+	if err := bnc.nsReconciler.RegisterNetworkController(bnc.nsHandlerSelf); err != nil {
+		return err
+	}
+	bnc.namespaceHandler = &factory.Handler{}
+	return nil
 }
+
 
 // aclLoggingUpdateNsInfo parses the provided annotation values and sets nsInfo.aclLogging.Deny and
 // nsInfo.aclLogging.Allow. If errors are encountered parsing the annotation, disable logging completely. If either

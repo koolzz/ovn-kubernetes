@@ -278,6 +278,10 @@ func newDefaultNetworkControllerCommon(
 		gatewayPodIndex:            newGatewayPodIndex(),
 		nsAppliedGWState:           newNSAppliedGWState(),
 	}
+	// Back-reference for the legacy WatchNamespaces test entry point;
+	// production paths register through the shared NamespaceController
+	// directly. See BaseNetworkController.nsHandlerSelf for the rationale.
+	oc.nsHandlerSelf = oc
 	// Allocate IPs for logical router port "GwRouterToJoinSwitchPrefix + OVNClusterRouter". This should always
 	// allocate the first IPs in the join switch subnets.
 	gwLRPIfAddrs, err := oc.getOVNClusterRouterPortToJoinSwitchIfAddrs()

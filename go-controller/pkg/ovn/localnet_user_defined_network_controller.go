@@ -209,6 +209,10 @@ func NewLocalnetUserDefinedNetworkController(
 			},
 		},
 	}
+	// Back-reference for the legacy WatchNamespaces test entry point;
+	// production paths register through the shared NamespaceController
+	// directly. See BaseNetworkController.nsHandlerSelf for the rationale.
+	oc.nsHandlerSelf = &oc.BaseUserDefinedNetworkController
 
 	if oc.allocatesPodAnnotation() {
 		var claimsReconciler persistentips.PersistentAllocations
