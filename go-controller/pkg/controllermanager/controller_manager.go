@@ -25,6 +25,7 @@ import (
 
 	ovncnitypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/cni/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	nscontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/namespace"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube"
@@ -70,6 +71,7 @@ type ControllerManager struct {
 	networkManager     networkmanager.Controller
 	routeImportManager routeimport.Controller
 	nodeController     *nodecontroller.NodeController
+	nsController       *nscontroller.NamespaceController
 
 	// eIPController programs OVN to support EgressIP
 	eIPController *ovn.EgressIPController
@@ -302,6 +304,7 @@ func NewControllerManager(ovnClient *util.OVNClientset, wf *factory.WatchFactory
 		}
 	}
 	cm.nodeController = nodecontroller.NewNodeController(cm.watchFactory, cm.networkManager.Interface())
+	cm.nsController = nscontroller.NewNamespaceController(cm.watchFactory, cm.networkManager.Interface())
 
 	if util.IsRouteAdvertisementsEnabled() {
 		if !config.OVNKubernetesFeature.EnableInterconnect {
@@ -524,6 +527,11 @@ func (cm *ControllerManager) Start(ctx context.Context) error {
 				return fmt.Errorf("failed to start UDN node topology controller: %v", err)
 			}
 		}
+		if cm.nsController != nil {
+			if err = cm.nsController.Start(); err != nil {
+				return fmt.Errorf("failed to start UDN namespace topology controller: %v", err)
+			}
+		}
 		if err = cm.networkManager.Start(); err != nil {
 			return fmt.Errorf("failed to start NAD Controller :%v", err)
 		}
@@ -558,6 +566,9 @@ func (cm *ControllerManager) Stop() {
 	if cm.networkManager != nil {
 		if cm.nodeController != nil {
 			cm.nodeController.Stop()
+		}
+		if cm.nsController != nil {
+			cm.nsController.Stop()
 		}
 		cm.networkManager.Stop()
 	}
