@@ -336,6 +336,11 @@ func (g *gatewayPodIndex) GatewaysForNamespace(ns string) map[string]bool {
 // PodsForNamespace returns a sorted copy of the gateway-pod keys
 // currently serving the namespace. Useful for callers (e.g., conntrack
 // flush, APB merge) that walk gateway pods directly.
+//
+// This view does NOT filter on payload.active — inactive pods (not
+// ready, no resolved gateway IPs) are included. Callers that only
+// care about pods currently programming routes must use
+// HasActiveGWPods or PerPodGatewaysForNamespace instead.
 func (g *gatewayPodIndex) PodsForNamespace(ns string) []string {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -346,6 +351,36 @@ func (g *gatewayPodIndex) PodsForNamespace(ns string) []string {
 	out := pods.UnsortedList()
 	sort.Strings(out)
 	return out
+}
+
+// HasActiveGWPods reports whether any gateway pod with active==true
+// currently serves the namespace. "Active" means the pod is ready and
+// has at least one resolved gateway IP — i.e., it would actually
+// program routes through this controller.
+//
+// Distinct from len(PodsForNamespace(ns)) > 0: that view includes
+// inactive payloads. Callers gating "is there still a pod-derived
+// gateway?" (e.g. the SNAT-restore fan-out in updateNamespace) must
+// use this helper, or removing the last namespace annotation while
+// only inactive pod candidates remain would skip the SNAT restore
+// despite no active gateway being left.
+func (g *gatewayPodIndex) HasActiveGWPods(ns string) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	pods := g.byNamespace[ns]
+	if pods == nil {
+		return false
+	}
+	for podKey := range pods {
+		p, ok := g.payload[podKey]
+		if !ok {
+			continue
+		}
+		if p.active {
+			return true
+		}
+	}
+	return false
 }
 
 // PerPodGatewaysForNamespace returns a per-gateway-pod view of the

@@ -163,6 +163,38 @@ func TestGatewayPodIndex_BFDToggleSameTargets(t *testing.T) {
 	}
 }
 
+func TestGatewayPodIndex_HasActiveGWPods(t *testing.T) {
+	idx := newGatewayPodIndex()
+
+	if idx.HasActiveGWPods("ns-a") {
+		t.Fatal("empty index must not report active gateway pods")
+	}
+
+	// Ready pod → active, HasActiveGWPods must return true.
+	idx.Update(hostNetReadyGW("p1", "gw-ns", "ns-a", []string{"10.0.0.1"}, false, true))
+	if !idx.HasActiveGWPods("ns-a") {
+		t.Fatal("ready pod must count as an active gateway pod")
+	}
+
+	// Pod becomes not-ready: payload stays in the index (so
+	// PodsForNamespace still returns it), but active==false.
+	// HasActiveGWPods must return false — this is the load-bearing
+	// difference vs. len(PodsForNamespace) > 0 that drives the
+	// SNAT-restore fan-out gate in updateNamespace.
+	idx.Update(hostNetReadyGW("p1", "gw-ns", "ns-a", []string{"10.0.0.1"}, false, false))
+	if len(idx.PodsForNamespace("ns-a")) == 0 {
+		t.Fatal("test premise: inactive payload must remain in PodsForNamespace view")
+	}
+	if idx.HasActiveGWPods("ns-a") {
+		t.Fatal("not-ready pod must not count as an active gateway pod")
+	}
+
+	// Empty-namespace lookup is safe.
+	if idx.HasActiveGWPods("ns-unknown") {
+		t.Fatal("unknown namespace must report no active gateway pods")
+	}
+}
+
 func TestGatewayPodIndex_NotReadyDropsActive(t *testing.T) {
 	idx := newGatewayPodIndex()
 	// Ready pod first.
