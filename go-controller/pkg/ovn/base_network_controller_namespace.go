@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -70,6 +71,14 @@ func (bnc *BaseNetworkController) shouldWatchNamespaces() bool {
 // bnc.namespacesRegistered serves as the registered-already sentinel.
 // A future cleanup that migrates the ~99 pkg/ovn test callsites onto
 // the new path can drop this method and the back-reference together.
+//
+// Tests historically expected per-namespace setup to complete before
+// WatchNamespaces returned (the legacy retry framework's processExisting
+// callback fired AddFunc events synchronously enough that dependent
+// controllers' Start() saw fully-set-up port groups, etc.). Restore that
+// contract by waiting for the bootstrap reconciles to drain after
+// registration; without this, fast-following Start() calls in tests
+// race against the namespace controller's worker queue.
 func (bnc *BaseNetworkController) WatchNamespaces() error {
 	if !bnc.shouldWatchNamespaces() {
 		klog.Infof("Ignoring namespaces events for network: %s", bnc.GetNetworkName())
@@ -86,6 +95,9 @@ func (bnc *BaseNetworkController) WatchNamespaces() error {
 	}
 	if err := bnc.nsReconciler.RegisterNetworkController(bnc.nsHandlerSelf); err != nil {
 		return err
+	}
+	if err := bnc.nsReconciler.WaitForBootstrap(bnc.GetNetworkName(), 30*time.Second); err != nil {
+		return fmt.Errorf("WatchNamespaces: bootstrap drain failed: %w", err)
 	}
 	bnc.namespacesRegistered = true
 	return nil

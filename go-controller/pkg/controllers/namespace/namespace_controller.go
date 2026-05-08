@@ -6,10 +6,27 @@
 // are registered with the controller; the controller dispatches reconcile
 // keys of shape "<ns>|<net>" to the registered handler for net.
 //
-// This package is in the dormant state: the controller exists, can be
-// started, and accepts handler registrations, but no in-tree caller
-// registers handlers yet. Migration of pkg/ovn/*Network*Controller to use
-// it is gated on later phases (see namespace-migration-plan.md).
+// In-tree consumers: DefaultNetworkController plus all three UDN topology
+// controllers (Layer3, Layer2, Localnet) register their NamespaceHandler
+// implementations through this controller via
+// BaseNetworkController.registerNamespaceReconciler. The legacy
+// retryNamespaces watch was removed once all four were migrated; see
+// namespace-migration-plan.md for the full migration timeline.
+//
+// Key contracts:
+//
+//   - The transition gate in reconcileNamespace makes membership
+//     decisions before dispatch via handler.ClaimsNamespace, so a
+//     namespace moving between handlers (NAD change) reaches the right
+//     delete leg without the previous owner's state leaking.
+//   - WaitForBootstrap blocks until every namespace enqueued by
+//     bootstrapNetwork has had its FIRST reconcile attempt; failed
+//     reconciles stay in the workqueue's retry path but DON'T block
+//     dependent watchers' startup.
+//   - registerNamespaceReconciler in pkg/ovn folds Register +
+//     WaitForBootstrap so dependent watchers (NetworkPolicy, Pods) see
+//     a processed namespace cache, matching the legacy WatchNamespaces
+//     ordering contract.
 package namespace
 
 import (
@@ -66,14 +83,24 @@ type NamespaceController struct {
 	// handlers maps network name to namespace handler.
 	handlers *syncmap.SyncMap[NamespaceHandler]
 
-	// stateMu protects nsReconciliation, nsActive, nsNetworks, nsCache,
-	// and latestInformerNsCache.
+	// stateMu protects nsReconciliation, bootstrapPending, nsActive,
+	// nsNetworks, nsCache, and latestInformerNsCache.
 	stateMu sync.RWMutex
 	// nsReconciliation tracks namespaces that should be treated as
 	// "new" per network. The bool is true when the next reconcile
 	// should be a delete pass (mirrors NodeController.nodeReconciliation).
+	// Entries are cleared on SUCCESSFUL reconcile.
 	// keyed by network -> namespaces
 	nsReconciliation map[string]map[string]bool
+	// bootstrapPending tracks namespaces enqueued by bootstrapNetwork
+	// that haven't yet had their FIRST reconcile attempt complete (for
+	// any outcome, success or error). WaitForBootstrap watches this
+	// set, not nsReconciliation: a persistently-failing namespace must
+	// stay in the workqueue retry path but MUST NOT block dependent
+	// watchers' startup (legacy WatchNamespaces left failures in retry
+	// and returned).
+	// keyed by network -> namespaces
+	bootstrapPending map[string]map[string]struct{}
 	// nsActive tracks whether a namespace/network is active.
 	// presence indicates active.
 	// keyed by network -> namespaces
@@ -110,6 +137,7 @@ func NewController(wf *factory.WatchFactory, name string, networkManager network
 		nsLister:              nsInformer.Lister(),
 		handlers:              syncmap.NewSyncMap[NamespaceHandler](),
 		nsReconciliation:      map[string]map[string]bool{},
+		bootstrapPending:      map[string]map[string]struct{}{},
 		nsActive:              map[string]map[string]struct{}{},
 		nsNetworks:            map[string]map[string]struct{}{},
 		nsCache:               map[string]map[string]*corev1.Namespace{},
@@ -165,6 +193,53 @@ func (c *NamespaceController) ReconcileNetwork(nsName, netName string) {
 	c.nsController.Reconcile(scopedNamespaceQueueKey(nsName, netName))
 }
 
+// WaitForBootstrap blocks until every namespace enqueued by
+// bootstrapNetwork(netName) has had its FIRST reconcile attempt
+// complete (regardless of success), or the deadline elapses.
+//
+// The semantic is "attempted at least once," not "successfully
+// applied." A persistently-failing namespace stays in the workqueue
+// retry path with normal backoff; WaitForBootstrap returns as soon as
+// every bootstrap namespace has been picked up by a worker. Legacy
+// WatchNamespaces had the same contract — it enqueued initial adds,
+// left failures in retry, and returned. Without this split, a single
+// transient handler error (e.g. an in-flight NBDB hiccup or a
+// malformed external-gateway annotation that fails parse) would brick
+// controller startup after the 30s timeout.
+//
+// Used by callers that need to know per-namespace setup has been
+// PROCESSED once (so dependent watchers like NetworkPolicy don't race
+// the namespace's add path), not callers that need every namespace to
+// be in a known-good state.
+func (c *NamespaceController) WaitForBootstrap(netName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		c.stateMu.RLock()
+		pendingCount := len(c.bootstrapPending[netName])
+		var sample []string
+		if pendingCount > 0 {
+			// Capture up to 5 pending namespaces for the timeout
+			// error message — operators debugging a hung startup
+			// need to know which namespaces never got picked up.
+			for ns := range c.bootstrapPending[netName] {
+				sample = append(sample, ns)
+				if len(sample) == 5 {
+					break
+				}
+			}
+		}
+		c.stateMu.RUnlock()
+		if pendingCount == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s: bootstrap drain for network %q exceeded %s (%d namespaces pending; sample: %v)",
+				c.name, netName, timeout, pendingCount, sample)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // AnnotationCache returns the cache used for parsed namespace annotations.
 func (c *NamespaceController) AnnotationCache() *NamespaceAnnotationCache {
 	return c.annotationCache
@@ -201,6 +276,7 @@ func (c *NamespaceController) DeregisterNetworkController(netName string) {
 		c.handlers.Delete(key)
 		c.stateMu.Lock()
 		delete(c.nsReconciliation, key)
+		delete(c.bootstrapPending, key)
 		if nss, ok := c.nsActive[key]; ok {
 			for nsName := range nss {
 				if networks, ok := c.nsNetworks[nsName]; ok {
@@ -232,6 +308,14 @@ func (c *NamespaceController) reconcileNamespace(key string) error {
 	}
 
 	return c.handlers.DoWithLock(netName, func(handlerKey string) error {
+		// markBootstrapAttempted is called on EVERY path out of this
+		// callback so WaitForBootstrap unblocks once every bootstrap
+		// namespace has been picked up by a worker, even if the
+		// reconcile errored. See WaitForBootstrap's doc for the
+		// availability rationale. Idempotent for non-bootstrap
+		// namespaces and re-attempts.
+		defer c.markBootstrapAttempted(netName, nsName)
+
 		handler, ok := c.handlers.Load(handlerKey)
 		if !ok || handler == nil {
 			return nil
@@ -340,11 +424,32 @@ func (c *NamespaceController) setBootstrapNamespaces(netName string, nss []*core
 	if len(nss) == 0 {
 		return
 	}
-	out := make(map[string]bool, len(nss))
+	recon := make(map[string]bool, len(nss))
+	pending := make(map[string]struct{}, len(nss))
 	for _, ns := range nss {
-		out[ns.Name] = false
+		recon[ns.Name] = false
+		pending[ns.Name] = struct{}{}
 	}
-	c.nsReconciliation[netName] = out
+	c.nsReconciliation[netName] = recon
+	c.bootstrapPending[netName] = pending
+}
+
+// markBootstrapAttempted records that nsName has had its first
+// reconcile attempt for netName. Idempotent — calls for namespaces
+// not in the bootstrap set, or already-attempted namespaces, are
+// no-ops. Called from reconcileNamespace via defer so the mark fires
+// for every attempt regardless of outcome.
+func (c *NamespaceController) markBootstrapAttempted(netName, nsName string) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	pending, ok := c.bootstrapPending[netName]
+	if !ok {
+		return
+	}
+	delete(pending, nsName)
+	if len(pending) == 0 {
+		delete(c.bootstrapPending, netName)
+	}
 }
 
 func (c *NamespaceController) namespaceNeedsReconciliation(netName, nsName string) bool {
