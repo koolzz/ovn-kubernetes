@@ -332,18 +332,76 @@ func (bnc *BaseNetworkController) configureNamespaceCommon(nsInfo *namespaceInfo
 	return nil
 }
 
-// GetNamespaceACLLogging retrieves ACLLoggingLevels for the Namespace.
-// nsInfo will be locked (and unlocked at the end) for given namespace if it exists.
-func (bnc *BaseNetworkController) GetNamespaceACLLogging(ns string) *libovsdbutil.ACLLoggingLevels {
+// GetNamespaceACLLogging retrieves ACLLoggingLevels for the Namespace by
+// value. Returns a zero-value struct if the namespace is unknown.
+//
+// This used to return a pointer to nsInfo.aclLogging after the lock was
+// released, which is a race the caller could not avoid. The current
+// implementation deep-copies the value while the lock is held.
+func (bnc *BaseNetworkController) GetNamespaceACLLogging(ns string) libovsdbutil.ACLLoggingLevels {
 	nsInfo, nsUnlock := bnc.getNamespaceLocked(ns, true)
 	if nsInfo == nil {
-		return &libovsdbutil.ACLLoggingLevels{
-			Allow: "",
-			Deny:  "",
-		}
+		return libovsdbutil.ACLLoggingLevels{}
 	}
 	defer nsUnlock()
-	return &nsInfo.aclLogging
+	return nsInfo.aclLogging
+}
+
+// GetNamespaceExternalGWs returns a deep copy of the namespace's parsed
+// external-gateway annotation state. Returns a zero-value gatewayInfo if
+// the namespace is unknown.
+func (bnc *BaseNetworkController) GetNamespaceExternalGWs(ns string) gatewayInfo {
+	nsInfo, nsUnlock := bnc.getNamespaceLocked(ns, true)
+	if nsInfo == nil {
+		return gatewayInfo{gws: sets.New[string]()}
+	}
+	defer nsUnlock()
+	return gatewayInfo{
+		gws:        sets.New(nsInfo.routingExternalGWs.gws.UnsortedList()...),
+		bfdEnabled: nsInfo.routingExternalGWs.bfdEnabled,
+	}
+}
+
+// GetNamespaceExternalPodGWs returns a deep copy of the namespace's
+// gateway-pod-derived gateway info map. Returns an empty map if the
+// namespace is unknown.
+func (bnc *BaseNetworkController) GetNamespaceExternalPodGWs(ns string) map[string]gatewayInfo {
+	nsInfo, nsUnlock := bnc.getNamespaceLocked(ns, true)
+	if nsInfo == nil {
+		return map[string]gatewayInfo{}
+	}
+	defer nsUnlock()
+	out := make(map[string]gatewayInfo, len(nsInfo.routingExternalPodGWs))
+	for k, v := range nsInfo.routingExternalPodGWs {
+		out[k] = gatewayInfo{
+			gws:        sets.New(v.gws.UnsortedList()...),
+			bfdEnabled: v.bfdEnabled,
+		}
+	}
+	return out
+}
+
+// GetNamespaceMulticastEnabled returns whether multicast is currently
+// enabled for the namespace. Returns false if the namespace is unknown.
+func (bnc *BaseNetworkController) GetNamespaceMulticastEnabled(ns string) bool {
+	nsInfo, nsUnlock := bnc.getNamespaceLocked(ns, true)
+	if nsInfo == nil {
+		return false
+	}
+	defer nsUnlock()
+	return nsInfo.multicastEnabled
+}
+
+// GetNamespacePortGroup returns the namespace's port-group name. Returns
+// the empty string if the namespace is unknown or no port group has been
+// created.
+func (bnc *BaseNetworkController) GetNamespacePortGroup(ns string) string {
+	nsInfo, nsUnlock := bnc.getNamespaceLocked(ns, true)
+	if nsInfo == nil {
+		return ""
+	}
+	defer nsUnlock()
+	return nsInfo.portGroupName
 }
 
 func (bnc *BaseNetworkController) updateNamespaceAclLogging(ns, aclAnnotation string, nsInfo *namespaceInfo) error {
