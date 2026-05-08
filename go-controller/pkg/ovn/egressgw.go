@@ -42,6 +42,15 @@ type gatewayInfo struct {
 // addPodExternalGW handles detecting if a pod is serving as an external gateway for namespace(s) and adding routes
 // to all pods in that namespace
 func (oc *DefaultNetworkController) addPodExternalGW(pod *corev1.Pod) error {
+	// Shadow-write to gatewayPodIndex. Phase 1b is mid-migration: the
+	// legacy nsInfo state is still authoritative, but we keep the new
+	// reverse-index in sync so future substeps can flip readers over
+	// one site at a time. Update() returns the affected target ns set;
+	// the legacy code below handles the actual fan-out for now.
+	if oc.gatewayPodIndex != nil {
+		_ = oc.gatewayPodIndex.Update(pod)
+	}
+
 	podRoutingNamespaceAnno := pod.Annotations[util.RoutingNamespaceAnnotation]
 	if podRoutingNamespaceAnno == "" {
 		return nil
@@ -348,6 +357,14 @@ func (oc *DefaultNetworkController) deletePodGWRoute(routeInfo *apbroutecontroll
 // deletePodExternalGW detects if a given pod is acting as an external GW and removes all routes in all namespaces
 // associated with that pod
 func (oc *DefaultNetworkController) deletePodExternalGW(pod *corev1.Pod) (err error) {
+	// Shadow-write to gatewayPodIndex (Phase 1b mid-migration). The
+	// legacy delete flow below remains authoritative; we drop the
+	// pod from the index so its target ns set is up-to-date for any
+	// future reader.
+	if oc.gatewayPodIndex != nil {
+		_ = oc.gatewayPodIndex.Delete(makePodGWKey(pod))
+	}
+
 	podRoutingNamespaceAnno := pod.Annotations[util.RoutingNamespaceAnnotation]
 	if podRoutingNamespaceAnno == "" {
 		return nil

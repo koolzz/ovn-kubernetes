@@ -141,6 +141,15 @@ type DefaultNetworkController struct {
 	zoneChassisHandler *zoneic.ZoneChassisHandler
 
 	gatewayTopologyFactory *topology.GatewayTopologyFactory
+
+	// gatewayPodIndex tracks "which gateway pods serve which namespaces"
+	// for the multi-external-gateway feature. Source of truth is being
+	// migrated here from nsInfo.routingExternalPodGWs in phased
+	// substeps. Currently shadow-written: the legacy nsInfo state is
+	// still authoritative; this index is kept in sync so future
+	// substeps can flip readers over one at a time. See
+	// gateway_pod_index.go and namespace-migration-plan.md Phase 1b.
+	gatewayPodIndex *gatewayPodIndex
 }
 
 // NewDefaultNetworkController creates a new OVN controller for creating logical network
@@ -249,6 +258,7 @@ func newDefaultNetworkControllerCommon(
 		apbExternalRouteController: apbExternalRouteController,
 		svcController:              svcController,
 		gatewayTopologyFactory:     topology.NewGatewayTopologyFactory(cnci.nbClient),
+		gatewayPodIndex:            newGatewayPodIndex(),
 	}
 	// Allocate IPs for logical router port "GwRouterToJoinSwitchPrefix + OVNClusterRouter". This should always
 	// allocate the first IPs in the join switch subnets.
@@ -264,6 +274,23 @@ func newDefaultNetworkControllerCommon(
 		oc.eIPC.retryEgressIPPods = oc.retryEgressIPPods
 	}
 	return oc, nil
+}
+
+// bootstrapGatewayPodIndex populates oc.gatewayPodIndex from the pod
+// informer cache and flips its HasSynced() flag to true. Must complete
+// before WatchPods starts so the gateway-pod handler sees a warm index.
+func (oc *DefaultNetworkController) bootstrapGatewayPodIndex() error {
+	if oc.gatewayPodIndex == nil {
+		// Defensive: should never happen — the constructor always
+		// populates this field.
+		oc.gatewayPodIndex = newGatewayPodIndex()
+	}
+	pods, err := oc.watchFactory.GetAllPods()
+	if err != nil {
+		return fmt.Errorf("listing pods: %w", err)
+	}
+	oc.gatewayPodIndex.BootstrapFromPodList(pods)
+	return nil
 }
 
 func (oc *DefaultNetworkController) initRetryFramework() {
@@ -676,6 +703,17 @@ func (oc *DefaultNetworkController) run(_ context.Context) error {
 	metrics.MetricOVNKubeControllerSyncDuration.WithLabelValues("service").Set(endSvc.Seconds())
 	if err != nil {
 		return err
+	}
+
+	// Prime the gateway-pod index from the informer cache before pod
+	// events start firing. Namespace reconcile gates on
+	// gatewayPodIndex.HasSynced() before reading the index so a
+	// controller restart with stale OVN routes doesn't compute an empty
+	// desired-state and delete legitimate routes. The index is shadow-
+	// written by the gateway-pod paths today (legacy nsInfo state is
+	// still authoritative); see gateway_pod_index.go.
+	if err := oc.bootstrapGatewayPodIndex(); err != nil {
+		return fmt.Errorf("failed to bootstrap gateway-pod index: %w", err)
 	}
 
 	if err := WithSyncDurationMetric("pod", oc.WatchPods); err != nil {
