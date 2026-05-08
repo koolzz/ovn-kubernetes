@@ -37,15 +37,6 @@ type namespaceInfo struct {
 	// May be empty if the port group wasn't created.
 	portGroupName string
 
-	// Map of related network policies. Policy will add itself to this list when it's ready to subscribe
-	// to namespace Update events. Retry logic to update network policy based on namespace event is handled by namespace.
-	// Policy should only be added after successful create, and deleted before any network policy resources are deleted.
-	// This is the map of keys that can be used to get networkPolicy from oc.networkPolicies.
-	//
-	// You must hold the namespaceInfo's mutex to add/delete dependent policies.
-	// Namespace can take oc.networkPolicies key Lock while holding nsInfo lock, the opposite should never happen.
-	relatedNetworkPolicies map[string]bool
-
 	// routingExternalGWs is a slice of net.IP containing the values parsed from
 	// annotation k8s.ovn.org/routing-external-gws
 	routingExternalGWs gatewayInfo
@@ -237,10 +228,9 @@ func (bnc *BaseNetworkController) ensureNamespaceLockedCommon(ns string, readOnl
 	nsInfoExisted := false
 	if nsInfo == nil {
 		nsInfo = &namespaceInfo{
-			relatedNetworkPolicies: map[string]bool{},
-			multicastEnabled:       false,
-			routingExternalPodGWs:  make(map[string]gatewayInfo),
-			routingExternalGWs:     gatewayInfo{gws: sets.New[string](), bfdEnabled: false},
+			multicastEnabled:      false,
+			routingExternalPodGWs: make(map[string]gatewayInfo),
+			routingExternalGWs:    gatewayInfo{gws: sets.New[string](), bfdEnabled: false},
 		}
 		// we are creating nsInfo and going to set it in namespaces map
 		// so safe to hold the lock while we create and add it
