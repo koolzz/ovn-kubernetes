@@ -199,16 +199,6 @@ func (oc *DefaultNetworkController) checkAndDeleteStaleConntrackEntries() {
 	}
 }
 
-// addExternalGWsForNamespace handles adding annotated gw routes to all pods in namespace
-// This should only be called with a lock on nsInfo
-func (oc *DefaultNetworkController) addExternalGWsForNamespace(egress gatewayInfo, nsInfo *namespaceInfo, namespace string) error {
-	if egress.gws == nil {
-		return fmt.Errorf("unable to add gateways routes for namespace: %s, gateways are nil", namespace)
-	}
-	nsInfo.routingExternalGWs = egress
-	return oc.addGWRoutesForNamespace(namespace, egress)
-}
-
 func (oc *DefaultNetworkController) isPodInLocalZone(pod *corev1.Pod) (bool, error) {
 	node, err := oc.watchFactory.GetNode(pod.Spec.NodeName)
 	if err != nil {

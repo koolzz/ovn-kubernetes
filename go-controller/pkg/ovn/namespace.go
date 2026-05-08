@@ -87,19 +87,30 @@ func (oc *DefaultNetworkController) configureNamespace(nsInfo *namespaceInfo, ns
 	var errors []error
 
 	if annotation, ok := ns.Annotations[util.RoutingExternalGWsAnnotation]; ok {
+		_, bfdEnabled := ns.Annotations[util.BfdAnnotation]
 		exGateways, err := util.ParseRoutingExternalGWAnnotation(annotation)
 		if err != nil {
 			errors = append(errors, fmt.Errorf("failed to parse external gateway annotation (%v)", err))
+			// Match legacy behavior on a parse failure: leave the
+			// annotation gateways unset but still propagate the BFD
+			// flag for any reader that consults it without the gw set.
+			nsInfo.routingExternalGWs.bfdEnabled = bfdEnabled
 		} else {
-			_, bfdEnabled := ns.Annotations[util.BfdAnnotation]
-			err = oc.addExternalGWsForNamespace(gatewayInfo{gws: exGateways, bfdEnabled: bfdEnabled}, nsInfo, ns.Name)
-			if err != nil {
-				errors = append(errors, fmt.Errorf("failed to add external gateway for namespace %s (%v)", ns.Name, err))
-			}
+			// Keep nsInfo.routingExternalGWs in sync for the legacy
+			// cross-readers (addLocalPodToNamespace,
+			// addPodExternalGWForNamespace conntrack-merge,
+			// checkAndDeleteStaleConntrackEntries). Route programming
+			// itself is driven by reconcileGWStateForNamespace below.
+			nsInfo.routingExternalGWs = gatewayInfo{gws: exGateways, bfdEnabled: bfdEnabled}
 		}
-		if _, ok := ns.Annotations[util.BfdAnnotation]; ok {
-			nsInfo.routingExternalGWs.bfdEnabled = true
-		}
+	}
+
+	// Drive route programming through the namespace-level apply
+	// primitive. It reads desired state from (annotation +
+	// gatewayPodIndex), diffs against the applied snapshot, and
+	// invokes the existing add/delete primitives idempotently.
+	if err := oc.reconcileGWStateForNamespace(ns.Name); err != nil {
+		errors = append(errors, fmt.Errorf("failed to apply gateway state for namespace %s: %v", ns.Name, err))
 	}
 
 	if err := oc.configureNamespaceCommon(nsInfo, ns); err != nil {
@@ -158,22 +169,22 @@ func (oc *DefaultNetworkController) updateNamespace(old, newer *corev1.Namespace
 					}
 				}
 			}
-		} else {
-			if err := oc.deleteGWRoutesForNamespace(old.Name, nil); err != nil {
-				errors = append(errors, err)
-			}
-			nsInfo.routingExternalGWs = gatewayInfo{}
 		}
-		exGateways, err := util.ParseRoutingExternalGWAnnotation(gwAnnotation)
-		if err != nil {
-			errors = append(errors, err)
+		// Update nsInfo.routingExternalGWs to reflect the new annotation
+		// state for legacy cross-readers (conntrack merge, pod-add path).
+		// The actual route convergence is driven by
+		// reconcileGWStateForNamespace, which diffs (annotation +
+		// gatewayPodIndex) desired against the applied snapshot and
+		// emits exactly the deltas required.
+		if gwAnnotation == "" {
+			nsInfo.routingExternalGWs = gatewayInfo{}
+		} else if exGateways, err := util.ParseRoutingExternalGWAnnotation(gwAnnotation); err == nil {
+			nsInfo.routingExternalGWs = gatewayInfo{gws: exGateways, bfdEnabled: newBFDEnabled}
 		} else {
-			if exGateways.Len() != 0 {
-				err = oc.addExternalGWsForNamespace(gatewayInfo{gws: exGateways, bfdEnabled: newBFDEnabled}, nsInfo, old.Name)
-				if err != nil {
-					errors = append(errors, err)
-				}
-			}
+			errors = append(errors, err)
+		}
+		if err := oc.reconcileGWStateForNamespace(old.Name); err != nil {
+			errors = append(errors, fmt.Errorf("failed to apply gateway state for namespace %s: %v", old.Name, err))
 		}
 		if config.OVNKubernetesFeature.EnableInterconnect && oc.zone != types.OvnDefaultZone {
 			// If interconnect is disabled OR interconnect is running in single-zone-mode,
@@ -288,8 +299,14 @@ func (oc *DefaultNetworkController) deleteNamespace(ns *corev1.Namespace) error 
 	}
 	defer nsInfo.Unlock()
 
-	if err := oc.deleteGWRoutesForNamespace(ns.Name, nil); err != nil {
-		return fmt.Errorf("failed to delete GW routes for namespace: %s, error: %v", ns.Name, err)
+	// Drive the gateway-route teardown through the apply primitive:
+	// the namespace is gone from the informer so desired state is
+	// empty (modulo any active gateway-pod IPs in the index, which
+	// would still target this name), the diff against the applied
+	// snapshot produces the right delete delta, and the snapshot is
+	// cleared on success.
+	if err := oc.reconcileGWStateForNamespace(ns.Name); err != nil {
+		return fmt.Errorf("failed to apply gateway state teardown for namespace %s: %v", ns.Name, err)
 	}
 	if err := oc.multicastDeleteNamespace(ns, nsInfo); err != nil {
 		return fmt.Errorf("failed to delete multicast namespace error %v", err)
