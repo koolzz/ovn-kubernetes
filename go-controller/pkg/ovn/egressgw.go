@@ -399,11 +399,23 @@ func (oc *DefaultNetworkController) deletePodGWRoutesForNamespace(pod *corev1.Po
 		return nil
 	}
 	podGWKey := makePodGWKey(pod)
-	// check if any gateways were stored for this pod
-	foundGws, ok := nsInfo.routingExternalPodGWs[podGWKey]
+	// Compute the pod's prior gateway IPs directly from its
+	// annotation/network-status. Same data source the index payload was
+	// populated from, so this is byte-identical to what
+	// nsInfo.routingExternalPodGWs[podGWKey] held before its delete —
+	// without needing the legacy state.
+	priorGwIPs, gwIPsErr := getExGwPodIPs(pod)
+	if gwIPsErr != nil {
+		klog.Warningf("Cannot resolve gateway IPs for delete on pod %s/%s: %v", pod.Namespace, pod.Name, gwIPsErr)
+	}
+	_, bfdEnabled := pod.Annotations[util.BfdAnnotation]
+	foundGws := gatewayInfo{gws: priorGwIPs, bfdEnabled: bfdEnabled}
+	// Drop the legacy nsInfo entry too while we're here. nsInfo is no
+	// longer authoritative for gateway-pod state but is still being
+	// double-written; this keeps the two stores in lockstep until the
+	// legacy field is dropped in 1b.9.
 	delete(nsInfo.routingExternalPodGWs, podGWKey)
-	// Post-delete merged GW set comes from gatewayPodIndex (the new
-	// source of truth populated by Phase 1b shadow-writes). The
+	// Post-delete merged GW set comes from gatewayPodIndex. The
 	// gatewayPodIndex.Delete at the top of deletePodExternalGW has
 	// already evicted the pod, so this read reflects the post-delete
 	// view. Annotation-derived ns GWs still live on nsInfo.
@@ -412,31 +424,25 @@ func (oc *DefaultNetworkController) deletePodGWRoutesForNamespace(pod *corev1.Po
 		for ip := range oc.gatewayPodIndex.GatewaysForNamespace(namespace) {
 			existingGWs.Insert(ip)
 		}
-	} else {
-		for _, gwInfo := range nsInfo.routingExternalPodGWs {
-			existingGWs.Insert(gwInfo.gws.UnsortedList()...)
-		}
 	}
 	if config.OVNKubernetesFeature.EnableInterconnect && oc.zone != types.OvnDefaultZone {
 		existingGWs.Insert(nsInfo.routingExternalGWs.gws.UnsortedList()...)
 	}
 	nsUnlock()
 
-	if !ok || len(foundGws.gws) == 0 {
+	if priorGwIPs == nil || priorGwIPs.Len() == 0 {
 		klog.Infof("No gateways found to remove for annotated gateway pod: %s on namespace: %s",
 			pod, namespace)
 		return nil
 	}
 
 	if err := oc.deleteGWRoutesForNamespace(namespace, foundGws.gws); err != nil {
-		// add the entry back to nsInfo for retrying later
-		nsInfo, nsUnlock := oc.getNamespaceLocked(namespace, false)
-		if nsInfo == nil {
-			return fmt.Errorf("failed to get nsInfo %s to add back all the gw routes: %w", namespace, err)
-		}
-		// we add back all the gw routes as we don't know which specific route for which pod error-ed out
-		nsInfo.routingExternalPodGWs[podGWKey] = foundGws
-		nsUnlock()
+		// On failure, the index has already been Delete'd at the top
+		// of deletePodExternalGW. The natural retry path is the
+		// caller re-driving deletePodExternalGW with the same pod
+		// object, which recomputes foundGws from the annotation —
+		// same answer. No need to "restore" cache state since the
+		// data lives on the pod itself.
 		return fmt.Errorf("failed to delete GW routes for pod %s: %w", pod.Name, err)
 	}
 	// remove the exgw podIP from the namespace's k8s.ovn.org/external-gw-pod-ips list
