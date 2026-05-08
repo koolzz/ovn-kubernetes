@@ -15,7 +15,6 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
-	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	libovsdbutil "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/util"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
@@ -68,7 +67,7 @@ func (bnc *BaseNetworkController) shouldWatchNamespaces() bool {
 // shared NamespaceController via the controller's nsHandlerSelf
 // back-reference. Production paths call registerNamespaceReconciler
 // directly from each controller's run(). Idempotent —
-// bnc.namespaceHandler doubles as the registered-already sentinel.
+// bnc.namespacesRegistered serves as the registered-already sentinel.
 // A future cleanup that migrates the ~99 pkg/ovn test callsites onto
 // the new path can drop this method and the back-reference together.
 func (bnc *BaseNetworkController) WatchNamespaces() error {
@@ -76,7 +75,7 @@ func (bnc *BaseNetworkController) WatchNamespaces() error {
 		klog.Infof("Ignoring namespaces events for network: %s", bnc.GetNetworkName())
 		return nil
 	}
-	if bnc.namespaceHandler != nil {
+	if bnc.namespacesRegistered {
 		return nil
 	}
 	if bnc.nsReconciler == nil || bnc.nsHandlerSelf == nil {
@@ -88,7 +87,7 @@ func (bnc *BaseNetworkController) WatchNamespaces() error {
 	if err := bnc.nsReconciler.RegisterNetworkController(bnc.nsHandlerSelf); err != nil {
 		return err
 	}
-	bnc.namespaceHandler = &factory.Handler{}
+	bnc.namespacesRegistered = true
 	return nil
 }
 

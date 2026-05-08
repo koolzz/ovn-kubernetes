@@ -131,8 +131,11 @@ type BaseNetworkController struct {
 
 	// pod events factory handler
 	podHandler *factory.Handler
-	// namespace events factory Handler
-	namespaceHandler *factory.Handler
+	// namespacesRegistered tracks whether the test-only WatchNamespaces
+	// shim has already registered this controller with the shared
+	// NamespaceController. The shim short-circuits when this is true
+	// so repeated calls in the same test setup are safe.
+	namespacesRegistered bool
 	// ipam claims events factory Handler
 	ipamClaimsHandler *factory.Handler
 
