@@ -20,6 +20,7 @@ import (
 
 	hotypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/hybrid-overlay/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	nscontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/namespace"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	egressipv1 "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressip/v1"
 	egressqoslisters "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressqos/v1/apis/listers/egressqos/v1"
@@ -161,10 +162,11 @@ func NewDefaultNetworkController(
 	portCache *PortCache,
 	addressSetManager *addresssetmanager.AddressSetManager,
 	nodeReconciler *nodecontroller.NodeController,
+	nsReconciler *nscontroller.NamespaceController,
 ) (*DefaultNetworkController, error) {
 	stopChan := make(chan struct{})
 	wg := &sync.WaitGroup{}
-	return newDefaultNetworkControllerCommon(cnci, stopChan, wg, nil, networkManager, routeImportManager, observManager, eIPController, portCache, addressSetManager, nodeReconciler)
+	return newDefaultNetworkControllerCommon(cnci, stopChan, wg, nil, networkManager, routeImportManager, observManager, eIPController, portCache, addressSetManager, nodeReconciler, nsReconciler)
 }
 
 func newDefaultNetworkControllerCommon(
@@ -179,9 +181,13 @@ func newDefaultNetworkControllerCommon(
 	portCache *PortCache,
 	addressSetManager *addresssetmanager.AddressSetManager,
 	nodeReconciler *nodecontroller.NodeController,
+	nsReconciler *nscontroller.NamespaceController,
 ) (*DefaultNetworkController, error) {
 	if nodeReconciler == nil {
 		return nil, fmt.Errorf("shared node reconciler is required for the default network controller")
+	}
+	if nsReconciler == nil {
+		return nil, fmt.Errorf("shared namespace reconciler is required for the default network controller")
 	}
 
 	defaultNetInfo := &util.DefaultNetInfo{}
@@ -248,6 +254,7 @@ func newDefaultNetworkControllerCommon(
 			addressSetManager:           addressSetManager,
 			nodeReconciler:              nodeReconciler,
 			nodeAnnotationCache:         nodeReconciler.AnnotationCache(),
+			nsReconciler:                nsReconciler,
 		},
 		externalGatewayRouteInfo:   apbExternalRouteController.ExternalGWRouteInfoCache,
 		eIPC:                       eIPController,
@@ -373,6 +380,7 @@ func (oc *DefaultNetworkController) Start(ctx context.Context) error {
 // Stop gracefully stops the controller
 func (oc *DefaultNetworkController) Stop() {
 	oc.DeregisterNodeHandler()
+	oc.DeregisterNamespaceHandler()
 	if oc.dnsNameResolver != nil {
 		oc.dnsNameResolver.Shutdown()
 	}
@@ -681,9 +689,16 @@ func (oc *DefaultNetworkController) run(_ context.Context) error {
 	klog.Info("Starting all the Watchers...")
 	start := time.Now()
 
-	// WatchNamespaces() should be started first because it has no other
-	// dependencies, and node startup depends on it.
-	if err := WithSyncDurationMetric("namespace", oc.WatchNamespaces); err != nil {
+	// Namespace handling for the default network now flows through the
+	// shared NamespaceController (Phase 3a). Registering the handler
+	// triggers a synchronous bootstrap pass — SyncNamespaces is run
+	// against the current informer list, and per-ns reconciles are
+	// enqueued — before this returns. Same ordering contract the legacy
+	// WatchNamespaces had, so node startup (which depends on namespaces)
+	// continues to see a fully-bootstrapped namespace cache.
+	if err := WithSyncDurationMetric("namespace", func() error {
+		return oc.nsReconciler.RegisterNetworkController(oc)
+	}); err != nil {
 		return err
 	}
 

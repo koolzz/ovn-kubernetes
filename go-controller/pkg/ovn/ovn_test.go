@@ -31,6 +31,7 @@ import (
 
 	ovncnitypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/cni/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	nscontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/namespace"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	adminpolicybasedrouteapi "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/adminpolicybasedroute/v1"
 	adminpolicybasedroutefake "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/adminpolicybasedroute/v1/apis/clientset/versioned/fake"
@@ -495,7 +496,8 @@ func NewOvnController(
 	}
 
 	nodeReconciler := nodecontroller.NewNodeController(wf, networkManager)
-	dnc, err := newDefaultNetworkControllerCommon(cnci, stopChan, wg, addressSetFactory, networkManager, nil, nil, eIPController, portCache, addressSetManager, nodeReconciler)
+	nsReconciler := nscontroller.NewNamespaceController(wf, networkManager)
+	dnc, err := newDefaultNetworkControllerCommon(cnci, stopChan, wg, addressSetFactory, networkManager, nil, nil, eIPController, portCache, addressSetManager, nodeReconciler, nsReconciler)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	if nbZoneFailed {

@@ -379,7 +379,7 @@ func (cm *ControllerManager) initDefaultNetworkController(observManager *observa
 	if err != nil {
 		return fmt.Errorf("failed to create common network controller info: %w", err)
 	}
-	defaultController, err := ovn.NewDefaultNetworkController(cnci, observManager, cm.networkManager.Interface(), cm.routeImportManager, cm.eIPController, cm.portCache, cm.addressSetManager, cm.nodeController)
+	defaultController, err := ovn.NewDefaultNetworkController(cnci, observManager, cm.networkManager.Interface(), cm.routeImportManager, cm.eIPController, cm.portCache, cm.addressSetManager, cm.nodeController, cm.nsController)
 	if err != nil {
 		return err
 	}

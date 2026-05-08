@@ -29,6 +29,7 @@ import (
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/allocator/pod"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	nscontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/namespace"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube"
@@ -109,6 +110,12 @@ type BaseNetworkController struct {
 	nodeReconciler *nodecontroller.NodeController
 	// node annotation cache for shared node controllers (optional)
 	nodeAnnotationCache *nodecontroller.NodeAnnotationCache
+
+	// nsReconciler is the shared namespace controller used by
+	// controllers that reconcile namespace state through
+	// pkg/controllers/namespace. Optional today: only the default
+	// network registers a handler in Phase 3a; UDNs follow in 3b.
+	nsReconciler *nscontroller.NamespaceController
 
 	// pod events factory handler
 	podHandler *factory.Handler
@@ -293,6 +300,15 @@ func (oc *BaseNetworkController) doReconcile(reconcileRoutes, reconcilePendingPo
 // DeregisterNodeHandler removes this controller from the shared node controller.
 func (oc *BaseNetworkController) DeregisterNodeHandler() {
 	oc.nodeReconciler.DeregisterNetworkController(oc.GetNetworkName())
+}
+
+// DeregisterNamespaceHandler removes this controller from the shared
+// namespace controller. No-op if the controller never registered.
+func (oc *BaseNetworkController) DeregisterNamespaceHandler() {
+	if oc.nsReconciler == nil {
+		return
+	}
+	oc.nsReconciler.DeregisterNetworkController(oc.GetNetworkName())
 }
 
 // BaseUserDefinedNetworkController structure holds per-network fields and network specific
