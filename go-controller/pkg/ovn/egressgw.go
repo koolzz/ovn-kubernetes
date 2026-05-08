@@ -116,7 +116,14 @@ func (oc *DefaultNetworkController) addPodExternalGWForNamespace(namespace strin
 
 	klog.Infof("Adding routes for external gateway pod: %s, next hops: %q, namespace: %s, bfd-enabled: %t",
 		pod.Name, strings.Join(egress.gws.UnsortedList(), ","), namespace, egress.bfdEnabled)
-	err = oc.addGWRoutesForNamespace(namespace, egress)
+	// Drive route programming through the namespace-level apply
+	// primitive. It reads desired state from (annotation +
+	// gatewayPodIndex) — the index has already been updated at the
+	// top of addPodExternalGW — and reconciles against the snapshot.
+	// This handles the duplicate-contributor case correctly: if two
+	// gateway pods contribute the same IP, deleting one leaves the
+	// route in place because the other still desires it.
+	err = oc.reconcileGWStateForNamespace(namespace)
 	if err != nil {
 		return err
 	}
@@ -379,16 +386,6 @@ func (oc *DefaultNetworkController) deletePodGWRoutesForNamespace(pod *corev1.Po
 	if nsInfo == nil {
 		return nil
 	}
-	// Compute the pod's prior gateway IPs directly from its
-	// annotation/network-status. Same data source the index payload was
-	// populated from, so this is byte-identical to what the legacy
-	// gateway-pod state used to cache — without needing the cache.
-	priorGwIPs, gwIPsErr := getExGwPodIPs(pod)
-	if gwIPsErr != nil {
-		klog.Warningf("Cannot resolve gateway IPs for delete on pod %s/%s: %v", pod.Namespace, pod.Name, gwIPsErr)
-	}
-	_, bfdEnabled := pod.Annotations[util.BfdAnnotation]
-	foundGws := gatewayInfo{gws: priorGwIPs, bfdEnabled: bfdEnabled}
 	// Post-delete merged GW set comes from gatewayPodIndex. The
 	// gatewayPodIndex.Delete at the top of deletePodExternalGW has
 	// already evicted the pod, so this read reflects the post-delete
@@ -404,20 +401,17 @@ func (oc *DefaultNetworkController) deletePodGWRoutesForNamespace(pod *corev1.Po
 	}
 	nsUnlock()
 
-	if priorGwIPs == nil || priorGwIPs.Len() == 0 {
-		klog.Infof("No gateways found to remove for annotated gateway pod: %s on namespace: %s",
-			pod, namespace)
-		return nil
-	}
-
-	if err := oc.deleteGWRoutesForNamespace(namespace, foundGws.gws); err != nil {
-		// On failure, the index has already been Delete'd at the top
-		// of deletePodExternalGW. The natural retry path is the
-		// caller re-driving deletePodExternalGW with the same pod
-		// object, which recomputes foundGws from the annotation —
-		// same answer. No need to "restore" cache state since the
-		// data lives on the pod itself.
-		return fmt.Errorf("failed to delete GW routes for pod %s: %w", pod.Name, err)
+	// Drive route teardown through the namespace-level apply
+	// primitive. The pod has already been removed from the index, so
+	// reconcile will compute desired state without this pod's
+	// contribution and emit deletes only for IPs no longer desired by
+	// any source. This is strictly more correct than the legacy
+	// "delete every IP this pod was contributing" approach, which
+	// would drop a duplicate-contributor IP that other sources still
+	// wanted. Idempotent under retry — the index is already
+	// post-delete, so re-driving the caller converges without duplication.
+	if err := oc.reconcileGWStateForNamespace(namespace); err != nil {
+		return fmt.Errorf("failed to reconcile GW state for pod %s deletion: %w", pod.Name, err)
 	}
 	// remove the exgw podIP from the namespace's k8s.ovn.org/external-gw-pod-ips list
 	if !config.OVNKubernetesFeature.EnableInterconnect || oc.zone == types.OvnDefaultZone {
