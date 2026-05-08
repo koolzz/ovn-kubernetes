@@ -123,21 +123,17 @@ func (oc *DefaultNetworkController) checkAndDeleteStaleConntrackEntries() {
 			return
 		}
 		// Gateway-pod-derived GWs come from gatewayPodIndex (Phase 1b
-		// source of truth). The annotation-derived ns GWs still live
-		// on nsInfo until later substeps; read them under the
-		// namespace lock as before.
+		// source of truth). Annotation-derived ns GWs come from the
+		// namespace informer — parseAnnotationGWs is the same parser
+		// the apply primitive uses, so this read agrees with what
+		// reconcile would compute.
 		if oc.gatewayPodIndex != nil {
 			for ip := range oc.gatewayPodIndex.GatewaysForNamespace(namespace.Name) {
 				existingGWs.Insert(ip)
 			}
 		}
-		nsInfo, nsUnlock, err := oc.ensureNamespaceLocked(namespace.Name, false, nil)
-		if err != nil {
-			klog.Errorf("Failed to ensure namespace %s locked: %v", namespace, err)
-			return
-		}
-		existingGWs.Insert(nsInfo.routingExternalGWs.gws.UnsortedList()...)
-		nsUnlock()
+		nsAnno := parseAnnotationGWs(namespace)
+		existingGWs.Insert(nsAnno.gws.UnsortedList()...)
 		if len(existingGWs) > 0 {
 			pods, err := oc.watchFactory.GetPods(namespace.Name)
 			if err != nil {

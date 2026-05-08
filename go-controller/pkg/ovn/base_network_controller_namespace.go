@@ -38,13 +38,15 @@ type namespaceInfo struct {
 	// May be empty if the port group wasn't created.
 	portGroupName string
 
-	// routingExternalGWs is a slice of net.IP containing the values parsed from
-	// annotation k8s.ovn.org/routing-external-gws
-	routingExternalGWs gatewayInfo
-
-	// gateway-pod state (formerly routingExternalPodGWs) lives in
-	// DefaultNetworkController.gatewayPodIndex; UDN controllers do not
-	// have gateway pods. See namespace-migration-plan.md Phase 1b.
+	// External-gateway state has been moved off namespaceInfo:
+	//  - annotation-derived GWs (formerly routingExternalGWs) are read
+	//    directly from the namespace informer via parseAnnotationGWs.
+	//  - gateway-pod state (formerly routingExternalPodGWs) lives in
+	//    DefaultNetworkController.gatewayPodIndex; UDN controllers do
+	//    not have gateway pods.
+	// The applied OVN-state snapshot is on
+	// DefaultNetworkController.nsAppliedGWState. See
+	// namespace-migration-plan.md Phase 1b.6/1b.7.
 
 	multicastEnabled bool
 
@@ -237,8 +239,7 @@ func (bnc *BaseNetworkController) ensureNamespaceLockedCommon(ns string, readOnl
 	nsInfoExisted := false
 	if nsInfo == nil {
 		nsInfo = &namespaceInfo{
-			multicastEnabled:   false,
-			routingExternalGWs: gatewayInfo{gws: sets.New[string](), bfdEnabled: false},
+			multicastEnabled: false,
 		}
 		// we are creating nsInfo and going to set it in namespaces map
 		// so safe to hold the lock while we create and add it
@@ -343,21 +344,6 @@ func (bnc *BaseNetworkController) GetNamespaceACLLogging(ns string) libovsdbutil
 	}
 	defer nsUnlock()
 	return nsInfo.aclLogging
-}
-
-// GetNamespaceExternalGWs returns a deep copy of the namespace's parsed
-// external-gateway annotation state. Returns a zero-value gatewayInfo if
-// the namespace is unknown.
-func (bnc *BaseNetworkController) GetNamespaceExternalGWs(ns string) gatewayInfo {
-	nsInfo, nsUnlock := bnc.getNamespaceLocked(ns, true)
-	if nsInfo == nil {
-		return gatewayInfo{gws: sets.New[string]()}
-	}
-	defer nsUnlock()
-	return gatewayInfo{
-		gws:        sets.New(nsInfo.routingExternalGWs.gws.UnsortedList()...),
-		bfdEnabled: nsInfo.routingExternalGWs.bfdEnabled,
-	}
 }
 
 // GetNamespaceMulticastEnabled returns whether multicast is currently

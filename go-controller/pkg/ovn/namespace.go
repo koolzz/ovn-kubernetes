@@ -20,33 +20,34 @@ import (
 	utilerrors "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util/errors"
 )
 
-func (oc *DefaultNetworkController) getRoutingExternalGWs(nsInfo *namespaceInfo) *gatewayInfo {
-	res := gatewayInfo{}
-	// return a copy of the object so it can be handled without the
-	// namespace locked
-	res.bfdEnabled = nsInfo.routingExternalGWs.bfdEnabled
-	res.gws = sets.New(nsInfo.routingExternalGWs.gws.UnsortedList()...)
-	return &res
-}
-
 // addLocalPodToNamespace returns pod's routing gateway info and the ops needed
 // to add pod's IP to the namespace's address set and port group.
 //
-// The per-gateway-pod map is read from gatewayPodIndex (the new source of
-// truth populated by Phase 1b shadow-writes). The annotation-derived
-// gateway info is still read from nsInfo until later substeps.
+// Both gateway sources are read from their post-migration owners:
+//   - per-gateway-pod entries from gatewayPodIndex.
+//   - annotation-derived entries parsed directly from the namespace
+//     informer object (parseAnnotationGWs uses the same parser the
+//     apply primitive uses, so the pod-add path and namespace reconcile
+//     see the same desired state for any single namespace event).
 func (oc *DefaultNetworkController) addLocalPodToNamespace(ns string, portUUID string) (*gatewayInfo, map[string]gatewayInfo, []ovsdb.Operation, error) {
-	var err error
 	nsInfo, nsUnlock, err := oc.ensureNamespaceLocked(ns, true, nil)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to ensure namespace locked: %v", err)
 	}
-
 	defer nsUnlock()
 
 	ops, err := oc.addLocalPodToNamespaceLocked(nsInfo, portUUID)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+
+	annoGWs := &gatewayInfo{gws: sets.New[string]()}
+	if nsObj, err := oc.watchFactory.GetNamespace(ns); err == nil && nsObj != nil {
+		parsed := parseAnnotationGWs(nsObj)
+		if parsed.gws != nil {
+			annoGWs.gws = sets.New(parsed.gws.UnsortedList()...)
+		}
+		annoGWs.bfdEnabled = parsed.bfdEnabled
 	}
 	var podGWs map[string]gatewayInfo
 	if oc.gatewayPodIndex != nil {
@@ -54,7 +55,7 @@ func (oc *DefaultNetworkController) addLocalPodToNamespace(ns string, portUUID s
 	} else {
 		podGWs = map[string]gatewayInfo{}
 	}
-	return oc.getRoutingExternalGWs(nsInfo), podGWs, ops, nil
+	return annoGWs, podGWs, ops, nil
 }
 
 func isNamespaceMulticastEnabled(annotations map[string]string) bool {
@@ -84,21 +85,12 @@ func (oc *DefaultNetworkController) configureNamespace(nsInfo *namespaceInfo, ns
 	var errors []error
 
 	if annotation, ok := ns.Annotations[util.RoutingExternalGWsAnnotation]; ok {
-		_, bfdEnabled := ns.Annotations[util.BfdAnnotation]
-		exGateways, err := util.ParseRoutingExternalGWAnnotation(annotation)
-		if err != nil {
+		// We still parse the annotation here so a malformed value is
+		// surfaced through the handler's error return; the parsed
+		// value itself is consumed by the apply primitive below, which
+		// re-parses from the same namespace object.
+		if _, err := util.ParseRoutingExternalGWAnnotation(annotation); err != nil {
 			errors = append(errors, fmt.Errorf("failed to parse external gateway annotation (%v)", err))
-			// Match legacy behavior on a parse failure: leave the
-			// annotation gateways unset but still propagate the BFD
-			// flag for any reader that consults it without the gw set.
-			nsInfo.routingExternalGWs.bfdEnabled = bfdEnabled
-		} else {
-			// Keep nsInfo.routingExternalGWs in sync for the legacy
-			// cross-readers (addLocalPodToNamespace,
-			// addPodExternalGWForNamespace conntrack-merge,
-			// checkAndDeleteStaleConntrackEntries). Route programming
-			// itself is driven by reconcileGWStateForNamespace below.
-			nsInfo.routingExternalGWs = gatewayInfo{gws: exGateways, bfdEnabled: bfdEnabled}
 		}
 	}
 
@@ -133,18 +125,13 @@ func (oc *DefaultNetworkController) updateNamespace(old, newer *corev1.Namespace
 	_, oldBFDEnabled := old.Annotations[util.BfdAnnotation]
 
 	if gwAnnotation != oldGWAnnotation || newBFDEnabled != oldBFDEnabled {
-		// Update nsInfo.routingExternalGWs to reflect the new annotation
-		// state for legacy cross-readers (conntrack merge, pod-add path).
-		// The actual route convergence is driven by
-		// reconcileGWStateForNamespace, which diffs (annotation +
-		// gatewayPodIndex) desired against the applied snapshot and
-		// emits exactly the deltas required.
-		if gwAnnotation == "" {
-			nsInfo.routingExternalGWs = gatewayInfo{}
-		} else if exGateways, err := util.ParseRoutingExternalGWAnnotation(gwAnnotation); err == nil {
-			nsInfo.routingExternalGWs = gatewayInfo{gws: exGateways, bfdEnabled: newBFDEnabled}
-		} else {
-			errors = append(errors, err)
+		// Surface a parse error to the caller; the apply primitive
+		// below consumes the parsed annotation directly off the
+		// namespace object, so no nsInfo write is required here.
+		if gwAnnotation != "" {
+			if _, err := util.ParseRoutingExternalGWAnnotation(gwAnnotation); err != nil {
+				errors = append(errors, err)
+			}
 		}
 		// reconcileGWStateForNamespace drives both the route deltas and
 		// the IC-mode-specific side effects (annotation patch /
