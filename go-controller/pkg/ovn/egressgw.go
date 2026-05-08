@@ -174,16 +174,19 @@ func (oc *DefaultNetworkController) checkAndDeleteStaleConntrackEntries() {
 			klog.Errorf("Unable to retrieve gateway IPs for Admin Policy Based External Route objects for ns %s: %v", namespace.Name, err)
 			return
 		}
-		// by now the nsInfo cache must be repaired for this feature fully;
-		// however this introduces cache lock scale concern by doing this every minute
-		// versus previously this was done purely using annotations
+		// Gateway-pod-derived GWs come from gatewayPodIndex (Phase 1b
+		// source of truth). The annotation-derived ns GWs still live
+		// on nsInfo until later substeps; read them under the
+		// namespace lock as before.
+		if oc.gatewayPodIndex != nil {
+			for ip := range oc.gatewayPodIndex.GatewaysForNamespace(namespace.Name) {
+				existingGWs.Insert(ip)
+			}
+		}
 		nsInfo, nsUnlock, err := oc.ensureNamespaceLocked(namespace.Name, false, nil)
 		if err != nil {
 			klog.Errorf("Failed to ensure namespace %s locked: %v", namespace, err)
 			return
-		}
-		for _, gwInfo := range nsInfo.routingExternalPodGWs {
-			existingGWs.Insert(gwInfo.gws.UnsortedList()...)
 		}
 		existingGWs.Insert(nsInfo.routingExternalGWs.gws.UnsortedList()...)
 		nsUnlock()
@@ -399,9 +402,20 @@ func (oc *DefaultNetworkController) deletePodGWRoutesForNamespace(pod *corev1.Po
 	// check if any gateways were stored for this pod
 	foundGws, ok := nsInfo.routingExternalPodGWs[podGWKey]
 	delete(nsInfo.routingExternalPodGWs, podGWKey)
+	// Post-delete merged GW set comes from gatewayPodIndex (the new
+	// source of truth populated by Phase 1b shadow-writes). The
+	// gatewayPodIndex.Delete at the top of deletePodExternalGW has
+	// already evicted the pod, so this read reflects the post-delete
+	// view. Annotation-derived ns GWs still live on nsInfo.
 	existingGWs := sets.New[string]()
-	for _, gwInfo := range nsInfo.routingExternalPodGWs {
-		existingGWs.Insert(gwInfo.gws.UnsortedList()...)
+	if oc.gatewayPodIndex != nil {
+		for ip := range oc.gatewayPodIndex.GatewaysForNamespace(namespace) {
+			existingGWs.Insert(ip)
+		}
+	} else {
+		for _, gwInfo := range nsInfo.routingExternalPodGWs {
+			existingGWs.Insert(gwInfo.gws.UnsortedList()...)
+		}
 	}
 	if config.OVNKubernetesFeature.EnableInterconnect && oc.zone != types.OvnDefaultZone {
 		existingGWs.Insert(nsInfo.routingExternalGWs.gws.UnsortedList()...)
