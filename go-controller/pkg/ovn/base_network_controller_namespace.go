@@ -64,13 +64,13 @@ func (bnc *BaseNetworkController) shouldWatchNamespaces() bool {
 		bnc.IsUserDefinedNetwork() && util.IsMultiNetworkPoliciesSupportEnabled()
 }
 
-// WatchNamespaces is a transitional entry point retained for tests
-// (Phase 4.0): production paths call registerNamespaceReconciler
-// directly from each controller's run(). This routes the call through
-// the shared NamespaceController via the controller's back-reference
-// to its concrete NamespaceHandler. Idempotent — bnc.namespaceHandler
-// doubles as the registered-already sentinel during the migration.
-// Phase 4.1 removes both WatchNamespaces and the back-reference field.
+// WatchNamespaces is the test-only entry point that routes through the
+// shared NamespaceController via the controller's nsHandlerSelf
+// back-reference. Production paths call registerNamespaceReconciler
+// directly from each controller's run(). Idempotent —
+// bnc.namespaceHandler doubles as the registered-already sentinel.
+// A future cleanup that migrates the ~99 pkg/ovn test callsites onto
+// the new path can drop this method and the back-reference together.
 func (bnc *BaseNetworkController) WatchNamespaces() error {
 	if !bnc.shouldWatchNamespaces() {
 		klog.Infof("Ignoring namespaces events for network: %s", bnc.GetNetworkName())

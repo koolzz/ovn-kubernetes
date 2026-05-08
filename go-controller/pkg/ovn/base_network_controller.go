@@ -118,15 +118,15 @@ type BaseNetworkController struct {
 
 	// nsHandlerSelf is a back-reference to the concrete controller
 	// (DefaultNetworkController or *BaseUserDefinedNetworkController-
-	// embedding type) so that the legacy WatchNamespaces() entry point
-	// on the base type can register itself with the shared
+	// embedding type) so that the test-only WatchNamespaces() entry
+	// point on the base type can register itself with the shared
 	// NamespaceController. Set by each concrete controller's
 	// constructor after the embedded base is built. Production paths
-	// (each controller's run()) call registerNamespaceReconciler
-	// directly with the concrete handler and don't rely on this
-	// back-reference; it exists solely for transitional test
-	// compatibility (Phase 4.0). Phase 4.1 removes WatchNamespaces and
-	// this field together.
+	// call registerNamespaceReconciler directly from each controller's
+	// run() with the concrete handler and don't rely on this
+	// back-reference; it exists solely for the WatchNamespaces test
+	// shim. A future cleanup that migrates the ~99 test callsites onto
+	// the new path can drop both the field and the shim together.
 	nsHandlerSelf nscontroller.NamespaceHandler
 
 	// pod events factory handler

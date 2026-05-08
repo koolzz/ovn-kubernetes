@@ -10,10 +10,9 @@ import (
 )
 
 // Compile-time assertion: DefaultNetworkController satisfies the
-// shared NamespaceHandler interface. Once Phase 3a's switchover lands,
-// the controller will register this implementation with the shared
-// NamespaceController instead of running its own per-UDN
-// retryNamespaces watch.
+// shared NamespaceHandler interface. The controller's run() registers
+// this implementation with the shared NamespaceController; the legacy
+// retryNamespaces watch was removed in Phase 4.1.
 var _ nscontroller.NamespaceHandler = (*DefaultNetworkController)(nil)
 
 // ReconcileNamespace implements NamespaceHandler. The level-driven shape

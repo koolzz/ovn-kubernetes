@@ -42,11 +42,13 @@ type gatewayInfo struct {
 // addPodExternalGW handles detecting if a pod is serving as an external gateway for namespace(s) and adding routes
 // to all pods in that namespace
 func (oc *DefaultNetworkController) addPodExternalGW(pod *corev1.Pod) error {
-	// Shadow-write to gatewayPodIndex. Phase 1b is mid-migration: the
-	// legacy nsInfo state is still authoritative, but we keep the new
-	// reverse-index in sync so future substeps can flip readers over
-	// one site at a time. Update() returns the affected target ns set;
-	// the legacy code below handles the actual fan-out for now.
+	// gatewayPodIndex is the sole source of truth for gateway-pod
+	// state; keep it up-to-date at the top of the add path so the
+	// reconcile invocation downstream sees the post-update view.
+	// Update() returns the affected target ns set; we don't need it
+	// here because reconcileGWStateForNamespace recomputes from the
+	// index for the call-site namespace, but it remains useful for
+	// future fan-out paths.
 	if oc.gatewayPodIndex != nil {
 		_ = oc.gatewayPodIndex.Update(pod)
 	}
@@ -303,10 +305,9 @@ func (oc *DefaultNetworkController) deletePodGWRoute(routeInfo *apbroutecontroll
 // deletePodExternalGW detects if a given pod is acting as an external GW and removes all routes in all namespaces
 // associated with that pod
 func (oc *DefaultNetworkController) deletePodExternalGW(pod *corev1.Pod) (err error) {
-	// Shadow-write to gatewayPodIndex (Phase 1b mid-migration). The
-	// legacy delete flow below remains authoritative; we drop the
-	// pod from the index so its target ns set is up-to-date for any
-	// future reader.
+	// Drop the pod from the gatewayPodIndex (sole source of truth) at
+	// the top of the delete path so the reconcile invocation
+	// downstream sees the post-delete view.
 	if oc.gatewayPodIndex != nil {
 		_ = oc.gatewayPodIndex.Delete(makePodGWKey(pod))
 	}

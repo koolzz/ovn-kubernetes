@@ -153,13 +153,10 @@ type DefaultNetworkController struct {
 	// nsAppliedGWState is the per-namespace last-successfully-applied
 	// gateway state. The namespace-driven apply primitive
 	// (reconcileGWStateForNamespace) reads this to compute deltas and
-	// writes back on success. Currently dormant — populated only when
-	// reconcileGWStateForNamespace is invoked, which Phase 1b.6.c.2
-	// will wire into addNamespace/updateNamespace/deleteNamespace.
-	// Bootstrap-from-NBDB seeding is a Phase 1b.6.d follow-up; until
-	// then the snapshot starts empty on controller restart and
-	// converges to correct state on the first reconcile of each
-	// namespace whose annotation produces any gateway IPs.
+	// writes back on success. Seeded on controller start by
+	// bootstrapNSAppliedGWState, which walks NBDB for the gateway-pod
+	// static routes and reconstructs the snapshot per-namespace so the
+	// first reconcile after a restart sees the real applied state.
 	nsAppliedGWState *nsAppliedGWState
 }
 

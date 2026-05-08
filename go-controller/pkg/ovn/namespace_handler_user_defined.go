@@ -11,9 +11,9 @@ import (
 
 // Compile-time assertions: every concrete UDN controller satisfies the
 // shared NamespaceHandler interface through methods on
-// *BaseUserDefinedNetworkController. Once Phase 3b.3 lands, each UDN's
-// run() will register itself with the shared NamespaceController in
-// place of its per-network retryNamespaces watch.
+// *BaseUserDefinedNetworkController. Each UDN's run() registers itself
+// with the shared NamespaceController via registerNamespaceReconciler;
+// the legacy per-network retryNamespaces watch was removed in Phase 4.1.
 var (
 	_ nscontroller.NamespaceHandler = (*Layer3UserDefinedNetworkController)(nil)
 	_ nscontroller.NamespaceHandler = (*Layer2UserDefinedNetworkController)(nil)
