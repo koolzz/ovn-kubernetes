@@ -97,17 +97,26 @@ func (oc *DefaultNetworkController) addPodExternalGWForNamespace(namespace strin
 	if err != nil {
 		return fmt.Errorf("failed to ensure namespace locked: %v", err)
 	}
-	tmpPodGWs := oc.getRoutingPodGWs(nsInfo)
-	tmpPodGWs[makePodGWKey(pod)] = egress
-	if err = validateRoutingPodGWs(tmpPodGWs); err != nil {
-		nsUnlock()
-		return fmt.Errorf("unable to add pod: %s/%s as external gateway for namespace: %s, error: %v",
-			pod.Namespace, pod.Name, namespace, err)
-	}
+	// The duplicate-IP validation that used to live here
+	// (validateRoutingPodGWs) is incompatible with the new
+	// OR-on-collision merge for gateway-pod GWs in the same namespace —
+	// duplicates are explicitly allowed and merge their BFD flags. The
+	// caller (addPodExternalGW) has already updated gatewayPodIndex
+	// shadow-write at the top, so the post-add view is available.
 	nsInfo.routingExternalPodGWs[makePodGWKey(pod)] = egress
 	existingGWs := sets.NewString()
-	for _, gwInfo := range nsInfo.routingExternalPodGWs {
-		existingGWs.Insert(gwInfo.gws.UnsortedList()...)
+	// Read the post-Update merged GW set from the index. This matches
+	// today's "iterate all gateway-pod entries and union the gws" logic
+	// but reads from the new source of truth. The legacy nsInfo write
+	// above stays for now until the rest of Phase 1b lands.
+	if oc.gatewayPodIndex != nil {
+		for ip := range oc.gatewayPodIndex.GatewaysForNamespace(namespace) {
+			existingGWs.Insert(ip)
+		}
+	} else {
+		for _, gwInfo := range nsInfo.routingExternalPodGWs {
+			existingGWs.Insert(gwInfo.gws.UnsortedList()...)
+		}
 	}
 	if config.OVNKubernetesFeature.EnableInterconnect && oc.zone != types.OvnDefaultZone {
 		existingGWs.Insert(nsInfo.routingExternalGWs.gws.UnsortedList()...)

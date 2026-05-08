@@ -348,6 +348,34 @@ func (g *gatewayPodIndex) PodsForNamespace(ns string) []string {
 	return out
 }
 
+// PerPodGatewaysForNamespace returns a per-gateway-pod view of the
+// gateways serving the namespace, keyed by gateway-pod key. The shape
+// matches the legacy nsInfo.routingExternalPodGWs (map[podKey]gatewayInfo)
+// so callers swapping from nsInfo to the index don't need to reshape
+// downstream code. Only payloads with active==true are included.
+//
+// Returns a fresh map; values' gws sets are independent copies.
+func (g *gatewayPodIndex) PerPodGatewaysForNamespace(ns string) map[string]gatewayInfo {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	out := map[string]gatewayInfo{}
+	pods := g.byNamespace[ns]
+	if pods == nil {
+		return out
+	}
+	for podKey := range pods {
+		p, ok := g.payload[podKey]
+		if !ok || !p.active {
+			continue
+		}
+		out[podKey] = gatewayInfo{
+			gws:        sets.New(p.gws.UnsortedList()...),
+			bfdEnabled: p.bfdEnabled,
+		}
+	}
+	return out
+}
+
 // PayloadFor returns a copy of the last-observed payload for a pod, or
 // (zero, false) if the pod is not in the index. The returned sets are
 // independent copies.

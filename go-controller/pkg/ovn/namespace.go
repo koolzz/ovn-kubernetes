@@ -32,38 +32,12 @@ func (oc *DefaultNetworkController) getRoutingExternalGWs(nsInfo *namespaceInfo)
 	return &res
 }
 
-// wrapper function to log if there are duplicate gateway IPs present in the cache
-func validateRoutingPodGWs(podGWs map[string]gatewayInfo) error {
-	// map to hold IP/podName
-	ipTracker := make(map[string]string)
-	for podName, gwInfo := range podGWs {
-		for _, gwIP := range gwInfo.gws.UnsortedList() {
-			if foundPod, ok := ipTracker[gwIP]; ok {
-				return fmt.Errorf("duplicate IP found in ECMP Pod route cache! IP: %q, first pod: %q, second "+
-					"pod: %q", gwIP, podName, foundPod)
-			}
-			ipTracker[gwIP] = podName
-		}
-	}
-	return nil
-}
-
-func (oc *DefaultNetworkController) getRoutingPodGWs(nsInfo *namespaceInfo) map[string]gatewayInfo {
-	// return a copy of the object so it can be handled without the
-	// namespace locked
-	res := make(map[string]gatewayInfo)
-	for k, v := range nsInfo.routingExternalPodGWs {
-		item := gatewayInfo{
-			bfdEnabled: v.bfdEnabled,
-			gws:        sets.New(v.gws.UnsortedList()...),
-		}
-		res[k] = item
-	}
-	return res
-}
-
 // addLocalPodToNamespace returns pod's routing gateway info and the ops needed
 // to add pod's IP to the namespace's address set and port group.
+//
+// The per-gateway-pod map is read from gatewayPodIndex (the new source of
+// truth populated by Phase 1b shadow-writes). The annotation-derived
+// gateway info is still read from nsInfo until later substeps.
 func (oc *DefaultNetworkController) addLocalPodToNamespace(ns string, portUUID string) (*gatewayInfo, map[string]gatewayInfo, []ovsdb.Operation, error) {
 	var err error
 	nsInfo, nsUnlock, err := oc.ensureNamespaceLocked(ns, true, nil)
@@ -77,7 +51,13 @@ func (oc *DefaultNetworkController) addLocalPodToNamespace(ns string, portUUID s
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return oc.getRoutingExternalGWs(nsInfo), oc.getRoutingPodGWs(nsInfo), ops, nil
+	var podGWs map[string]gatewayInfo
+	if oc.gatewayPodIndex != nil {
+		podGWs = oc.gatewayPodIndex.PerPodGatewaysForNamespace(ns)
+	} else {
+		podGWs = map[string]gatewayInfo{}
+	}
+	return oc.getRoutingExternalGWs(nsInfo), podGWs, ops, nil
 }
 
 func isNamespaceMulticastEnabled(annotations map[string]string) bool {

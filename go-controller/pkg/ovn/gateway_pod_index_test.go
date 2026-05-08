@@ -232,7 +232,7 @@ func TestGatewayPodIndex_BootstrapFromPodList(t *testing.T) {
 		hostNetReadyGW("p1", "gw-ns", "ns-a", []string{"10.0.0.1"}, false, true),
 		hostNetReadyGW("p2", "gw-ns", "ns-a,ns-b", []string{"10.0.0.2"}, true, true),
 		// non-candidate
-		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "gw-ns", Name: "irrelevant"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "gw-ns", Name: "irrelevant"}},
 		// candidate but not ready
 		hostNetReadyGW("p3", "gw-ns", "ns-c", []string{"10.0.0.3"}, false, false),
 	}
@@ -276,6 +276,37 @@ func TestGatewayPodIndex_BootstrapReplacesState(t *testing.T) {
 	}
 	if len(idx.GatewaysForNamespace("ns-b")) == 0 {
 		t.Fatalf("re-bootstrap should populate ns-b")
+	}
+}
+
+func TestGatewayPodIndex_PerPodGatewaysForNamespace(t *testing.T) {
+	idx := newGatewayPodIndex()
+	idx.Update(hostNetReadyGW("p1", "gw-ns", "ns-a", []string{"10.0.0.1", "10.0.0.2"}, false, true))
+	idx.Update(hostNetReadyGW("p2", "gw-ns", "ns-a", []string{"10.0.0.3"}, true, true))
+	// Not-ready pod must NOT appear (active==false).
+	idx.Update(hostNetReadyGW("p3", "gw-ns", "ns-a", []string{"10.0.0.4"}, false, false))
+
+	got := idx.PerPodGatewaysForNamespace("ns-a")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 active entries; got %d (%+v)", len(got), got)
+	}
+	p1 := got["gw-ns_p1"]
+	if !p1.gws.Equal(sets.New("10.0.0.1", "10.0.0.2")) || p1.bfdEnabled {
+		t.Fatalf("p1 entry wrong: gws=%v bfd=%v", sortedList(p1.gws), p1.bfdEnabled)
+	}
+	p2 := got["gw-ns_p2"]
+	if !p2.gws.Equal(sets.New("10.0.0.3")) || !p2.bfdEnabled {
+		t.Fatalf("p2 entry wrong: gws=%v bfd=%v", sortedList(p2.gws), p2.bfdEnabled)
+	}
+	if _, hasP3 := got["gw-ns_p3"]; hasP3 {
+		t.Fatalf("not-ready p3 must be excluded; got %+v", got)
+	}
+
+	// Mutating the returned map / inner sets must not affect the index.
+	got["gw-ns_p1"].gws.Insert("9.9.9.9")
+	again := idx.PerPodGatewaysForNamespace("ns-a")
+	if again["gw-ns_p1"].gws.Has("9.9.9.9") {
+		t.Fatalf("mutation leaked into index")
 	}
 }
 
