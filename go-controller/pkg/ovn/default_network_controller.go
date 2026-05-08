@@ -149,6 +149,18 @@ type DefaultNetworkController struct {
 	// WatchPods runs (see bootstrapGatewayPodIndex); HasSynced() gates
 	// any reader that depends on the index for correctness.
 	gatewayPodIndex *gatewayPodIndex
+
+	// nsAppliedGWState is the per-namespace last-successfully-applied
+	// gateway state. The namespace-driven apply primitive
+	// (reconcileGWStateForNamespace) reads this to compute deltas and
+	// writes back on success. Currently dormant — populated only when
+	// reconcileGWStateForNamespace is invoked, which Phase 1b.6.c.2
+	// will wire into addNamespace/updateNamespace/deleteNamespace.
+	// Bootstrap-from-NBDB seeding is a Phase 1b.6.d follow-up; until
+	// then the snapshot starts empty on controller restart and
+	// converges to correct state on the first reconcile of each
+	// namespace whose annotation produces any gateway IPs.
+	nsAppliedGWState *nsAppliedGWState
 }
 
 // NewDefaultNetworkController creates a new OVN controller for creating logical network
@@ -264,6 +276,7 @@ func newDefaultNetworkControllerCommon(
 		svcController:              svcController,
 		gatewayTopologyFactory:     topology.NewGatewayTopologyFactory(cnci.nbClient),
 		gatewayPodIndex:            newGatewayPodIndex(),
+		nsAppliedGWState:           newNSAppliedGWState(),
 	}
 	// Allocate IPs for logical router port "GwRouterToJoinSwitchPrefix + OVNClusterRouter". This should always
 	// allocate the first IPs in the join switch subnets.

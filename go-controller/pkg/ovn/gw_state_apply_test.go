@@ -4,9 +4,13 @@
 package ovn
 
 import (
+	"errors"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 func gwState(entries map[string]bool) *desiredGWState {
@@ -174,6 +178,203 @@ func TestNSAppliedGWState_Namespaces(t *testing.T) {
 	want := []string{"ns-a", "ns-b", "ns-c"}
 	if got := s.Namespaces(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Namespaces should be sorted; got %v want %v", got, want)
+	}
+}
+
+// recordedAdd captures one addRoutesForNamespace call.
+type recordedAdd struct {
+	ns  string
+	ips []string
+	bfd bool
+}
+
+// recordedDelete captures one deleteRoutesForNamespace call.
+type recordedDelete struct {
+	ns  string
+	ips []string
+}
+
+// fakeGWRouteProgrammer records calls and returns optional errors. Used
+// to verify applyGWStateDelta's call sequence and grouping. Add IPs in
+// the recorded calls are sorted to keep test assertions deterministic.
+type fakeGWRouteProgrammer struct {
+	adds        []recordedAdd
+	deletes     []recordedDelete
+	addErr      error
+	deleteErr   error
+	failOnAddIP string // if non-empty, return addErr only when this IP is in the call
+}
+
+func (f *fakeGWRouteProgrammer) addRoutesForNamespace(ns string, info gatewayInfo) error {
+	ips := info.gws.UnsortedList()
+	sort.Strings(ips)
+	if f.failOnAddIP != "" && info.gws.Has(f.failOnAddIP) && f.addErr != nil {
+		return f.addErr
+	}
+	if f.addErr != nil && f.failOnAddIP == "" {
+		return f.addErr
+	}
+	f.adds = append(f.adds, recordedAdd{ns: ns, ips: ips, bfd: info.bfdEnabled})
+	return nil
+}
+
+func (f *fakeGWRouteProgrammer) deleteRoutesForNamespace(ns string, matchGWs sets.Set[string]) error {
+	ips := matchGWs.UnsortedList()
+	sort.Strings(ips)
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deletes = append(f.deletes, recordedDelete{ns: ns, ips: ips})
+	return nil
+}
+
+func TestApplyGWStateDelta_Empty(t *testing.T) {
+	f := &fakeGWRouteProgrammer{}
+	if err := applyGWStateDelta("ns1", gwStateDelta{}, f); err != nil {
+		t.Fatalf("empty delta should not error: %v", err)
+	}
+	if len(f.adds) != 0 || len(f.deletes) != 0 {
+		t.Fatalf("empty delta should produce no calls; got adds=%v deletes=%v", f.adds, f.deletes)
+	}
+}
+
+func TestApplyGWStateDelta_PureAdd_GroupsByBFD(t *testing.T) {
+	delta := gwStateDelta{
+		add: []gwIPBFD{
+			{"10.0.0.1", true},
+			{"10.0.0.2", false},
+			{"10.0.0.3", true},
+		},
+	}
+	f := &fakeGWRouteProgrammer{}
+	if err := applyGWStateDelta("ns1", delta, f); err != nil {
+		t.Fatalf("apply should not error: %v", err)
+	}
+	if len(f.deletes) != 0 {
+		t.Fatalf("pure-add should not delete anything; got %v", f.deletes)
+	}
+	if len(f.adds) != 2 {
+		t.Fatalf("expected 2 add calls (one per BFD group); got %d: %v", len(f.adds), f.adds)
+	}
+	// Iteration order: false first, true second (deterministic by code).
+	if !reflect.DeepEqual(f.adds[0], recordedAdd{ns: "ns1", ips: []string{"10.0.0.2"}, bfd: false}) {
+		t.Fatalf("first add wrong: %+v", f.adds[0])
+	}
+	if !reflect.DeepEqual(f.adds[1], recordedAdd{ns: "ns1", ips: []string{"10.0.0.1", "10.0.0.3"}, bfd: true}) {
+		t.Fatalf("second add wrong: %+v", f.adds[1])
+	}
+}
+
+func TestApplyGWStateDelta_PureRemove(t *testing.T) {
+	delta := gwStateDelta{remove: []string{"10.0.0.1", "10.0.0.2"}}
+	f := &fakeGWRouteProgrammer{}
+	if err := applyGWStateDelta("ns1", delta, f); err != nil {
+		t.Fatalf("apply should not error: %v", err)
+	}
+	if len(f.adds) != 0 {
+		t.Fatalf("pure-remove should not add anything; got %v", f.adds)
+	}
+	if len(f.deletes) != 1 {
+		t.Fatalf("expected single delete pass; got %d: %v", len(f.deletes), f.deletes)
+	}
+	want := recordedDelete{ns: "ns1", ips: []string{"10.0.0.1", "10.0.0.2"}}
+	if !reflect.DeepEqual(f.deletes[0], want) {
+		t.Fatalf("delete wrong: got %+v want %+v", f.deletes[0], want)
+	}
+}
+
+func TestApplyGWStateDelta_BFDReplace_DeletesThenAdds(t *testing.T) {
+	delta := gwStateDelta{
+		replace: []gwIPBFD{{"10.0.0.1", true}},
+	}
+	f := &fakeGWRouteProgrammer{}
+	if err := applyGWStateDelta("ns1", delta, f); err != nil {
+		t.Fatalf("apply should not error: %v", err)
+	}
+	if len(f.deletes) != 1 || !reflect.DeepEqual(f.deletes[0].ips, []string{"10.0.0.1"}) {
+		t.Fatalf("expected one delete for replace IP; got %v", f.deletes)
+	}
+	if len(f.adds) != 1 || !reflect.DeepEqual(f.adds[0], recordedAdd{ns: "ns1", ips: []string{"10.0.0.1"}, bfd: true}) {
+		t.Fatalf("expected one add for replace IP with new BFD; got %v", f.adds)
+	}
+}
+
+func TestApplyGWStateDelta_Mixed_DeleteThenAddOrder(t *testing.T) {
+	delta := gwStateDelta{
+		add:     []gwIPBFD{{"10.0.0.4", false}},
+		remove:  []string{"10.0.0.3"},
+		replace: []gwIPBFD{{"10.0.0.2", true}},
+	}
+	f := &fakeGWRouteProgrammer{}
+	if err := applyGWStateDelta("ns1", delta, f); err != nil {
+		t.Fatalf("apply should not error: %v", err)
+	}
+	// One delete pass covering remove + replace IPs (sorted).
+	if len(f.deletes) != 1 || !reflect.DeepEqual(f.deletes[0].ips, []string{"10.0.0.2", "10.0.0.3"}) {
+		t.Fatalf("expected single delete pass with merged IPs; got %v", f.deletes)
+	}
+	// Two add passes (one per BFD group, false first).
+	if len(f.adds) != 2 {
+		t.Fatalf("expected 2 add passes; got %d: %v", len(f.adds), f.adds)
+	}
+	if !reflect.DeepEqual(f.adds[0], recordedAdd{ns: "ns1", ips: []string{"10.0.0.4"}, bfd: false}) {
+		t.Fatalf("first add wrong: %+v", f.adds[0])
+	}
+	if !reflect.DeepEqual(f.adds[1], recordedAdd{ns: "ns1", ips: []string{"10.0.0.2"}, bfd: true}) {
+		t.Fatalf("second add wrong: %+v", f.adds[1])
+	}
+}
+
+func TestApplyGWStateDelta_DeleteFailureSkipsAdds(t *testing.T) {
+	delta := gwStateDelta{
+		add:    []gwIPBFD{{"10.0.0.1", false}},
+		remove: []string{"10.0.0.9"},
+	}
+	wantErr := errors.New("delete kaboom")
+	f := &fakeGWRouteProgrammer{deleteErr: wantErr}
+	err := applyGWStateDelta("ns1", delta, f)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected delete error to surface; got %v", err)
+	}
+	if len(f.adds) != 0 {
+		t.Fatalf("delete failure should skip add pass; got %v", f.adds)
+	}
+}
+
+func TestApplyGWStateDelta_AddFailurePropagates(t *testing.T) {
+	delta := gwStateDelta{
+		add: []gwIPBFD{
+			{"10.0.0.1", false},
+			{"10.0.0.2", true},
+		},
+	}
+	wantErr := errors.New("add kaboom")
+	f := &fakeGWRouteProgrammer{addErr: wantErr}
+	err := applyGWStateDelta("ns1", delta, f)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected add error to surface; got %v", err)
+	}
+}
+
+func TestApplyGWStateDelta_PartialAddFailure_SecondPassNotRun(t *testing.T) {
+	// Verify that if the first BFD group's add fails, the second
+	// group is not attempted — the namespace is left for the next
+	// reconcile to retry.
+	delta := gwStateDelta{
+		add: []gwIPBFD{
+			{"10.0.0.1", false},
+			{"10.0.0.2", true},
+		},
+	}
+	wantErr := errors.New("add kaboom")
+	f := &fakeGWRouteProgrammer{addErr: wantErr, failOnAddIP: "10.0.0.1"}
+	err := applyGWStateDelta("ns1", delta, f)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected add error; got %v", err)
+	}
+	// false group fired (and failed); true group did not.
+	if len(f.adds) != 0 {
+		t.Fatalf("failed first-group add should leave 0 successful records; got %v", f.adds)
 	}
 }
 

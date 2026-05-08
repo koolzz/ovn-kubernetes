@@ -6,7 +6,28 @@ package ovn
 import (
 	"sort"
 	"sync"
+
+	"k8s.io/apimachinery/pkg/util/sets"
 )
+
+// gwRouteProgrammer is the minimal route-programming surface the
+// namespace-driven apply primitive needs. The default network's
+// add/deleteGWRoutesForNamespace methods satisfy it. Extracted so the
+// apply primitive can be unit-tested without a full fakeOVN setup —
+// the real semantics of route creation/deletion belong to the existing
+// methods, which are exercised by the gateway-pod integration tests
+// already.
+type gwRouteProgrammer interface {
+	// addRoutesForNamespace programs OVN static routes for every IP
+	// in info.gws into ns, with the supplied BFD flag uniformly. The
+	// underlying primitive is idempotent: an IP that's already
+	// programmed via the same gateway router is skipped.
+	addRoutesForNamespace(ns string, info gatewayInfo) error
+	// deleteRoutesForNamespace removes OVN static routes whose
+	// gateway IP is in matchGWs. Pass an empty/nil set to delete all
+	// gateway routes for the namespace.
+	deleteRoutesForNamespace(ns string, matchGWs sets.Set[string]) error
+}
 
 // gwIPBFD pairs a gateway IP with its BFD flag. Used for the add/replace
 // legs of a gateway-state delta where per-IP BFD matters.
@@ -155,5 +176,75 @@ func (s *nsAppliedGWState) Namespaces() []string {
 		out = append(out, ns)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// applyGWStateDelta drives the IP-level reconvergence required to bring
+// applied state to desired state for a single namespace. It schedules:
+//
+//   1. one delete pass covering both pure-removes and BFD-replace IPs,
+//      so the BFD-replace re-add picks up the new flag rather than
+//      short-circuiting on the existing-route check inside
+//      addGWRoutesForPod;
+//   2. one add pass per BFD flag value, since the underlying primitive
+//      takes a single BFD flag for all IPs in its gatewayInfo.
+//
+// Order is delete-first to minimize the no-route window for replace
+// IPs. A single libovsdb transaction across delete + add is the ideal
+// (covered by Phase 1b.6 follow-up); today's primitives execute their
+// own transactions, so the BFD-flip case has a brief window where the
+// IP has no route. The window is bounded by one transaction round-trip
+// and only fires when an operator changes the BFD flag while the IP
+// itself is stable — a rare path.
+func applyGWStateDelta(ns string, delta gwStateDelta, p gwRouteProgrammer) error {
+	if delta.empty() {
+		return nil
+	}
+	deleteIPs := sets.New[string](delta.remove...)
+	for _, e := range delta.replace {
+		deleteIPs.Insert(e.ip)
+	}
+	if deleteIPs.Len() > 0 {
+		if err := p.deleteRoutesForNamespace(ns, deleteIPs); err != nil {
+			return err
+		}
+	}
+	addByBFD := groupAddsByBFD(delta)
+	for _, bfd := range []bool{false, true} {
+		ips, ok := addByBFD[bfd]
+		if !ok || ips.Len() == 0 {
+			continue
+		}
+		if err := p.addRoutesForNamespace(ns, gatewayInfo{
+			gws:        ips,
+			bfdEnabled: bfd,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// groupAddsByBFD merges delta.add and delta.replace into per-BFD-flag
+// IP sets. Replace IPs land in this same map because their re-add is
+// indistinguishable from an add for the purposes of the underlying
+// primitive — the preceding delete pass cleared the old route.
+func groupAddsByBFD(delta gwStateDelta) map[bool]sets.Set[string] {
+	if len(delta.add) == 0 && len(delta.replace) == 0 {
+		return nil
+	}
+	out := map[bool]sets.Set[string]{}
+	for _, e := range delta.add {
+		if out[e.bfd] == nil {
+			out[e.bfd] = sets.New[string]()
+		}
+		out[e.bfd].Insert(e.ip)
+	}
+	for _, e := range delta.replace {
+		if out[e.bfd] == nil {
+			out[e.bfd] = sets.New[string]()
+		}
+		out[e.bfd].Insert(e.ip)
+	}
 	return out
 }
