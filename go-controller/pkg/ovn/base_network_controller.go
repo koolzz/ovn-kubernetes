@@ -96,8 +96,6 @@ type BaseNetworkController struct {
 
 	// retry framework for pods
 	retryPods *ovnretry.RetryFramework
-	// retry framework for namespaces
-	retryNamespaces *ovnretry.RetryFramework
 	// retry framework for network policies
 	retryNetworkPolicies *ovnretry.RetryFramework
 	// retry framework for network policies
@@ -290,22 +288,11 @@ func (oc *BaseNetworkController) doReconcile(reconcileRoutes, reconcilePendingPo
 	// network controller creates the address set for the namespace.
 	// To update gress policy ACLs with peer namespace address set, invoke requeuePeerNamespace method after
 	// address set is created for the namespace.
-	namespaceAdded := false
-	for _, ns := range reconcileNamespaces {
-		namespace, err := oc.watchFactory.GetNamespace(ns)
-		if err != nil {
-			klog.Infof("Failed to get namespace %s for reconciling network %s: %v", ns, oc.GetNetworkName(), err)
-			continue
+	if oc.nsReconciler != nil {
+		for _, ns := range reconcileNamespaces {
+			oc.nsReconciler.MarkNamespaceNeedsReconciliation(oc.GetNetworkName(), ns)
+			oc.nsReconciler.ReconcileNetwork(ns, oc.GetNetworkName())
 		}
-		err = oc.retryNamespaces.AddRetryObjWithAddNoBackoff(namespace)
-		if err != nil {
-			klog.Infof("Failed to retry namespace %s for network %s: %v", ns, oc.GetNetworkName(), err)
-			continue
-		}
-		namespaceAdded = true
-	}
-	if namespaceAdded {
-		oc.retryNamespaces.RequestRetryObjs()
 	}
 	return nil
 }

@@ -656,17 +656,16 @@ func (oc *Layer2UserDefinedNetworkController) initRetryFramework() {
 	}
 
 	// When a user-defined network is enabled as a primary network for namespace,
-	// then watch for namespace and network policy events.
+	// then watch for network policy events. Namespace handling flows through
+	// the shared NamespaceController; see registerNamespaceReconciler in run().
 	if oc.IsPrimaryNetwork() {
-		oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
 		oc.retryNetworkPolicies = oc.newRetryFramework(factory.PolicyType)
 	}
 
-	// For secondary networks, we don't have to watch namespace events if
-	// multi-network policy support is not enabled. We don't support
+	// For secondary networks, we don't have to watch network-policy-shaped
+	// events if multi-network policy support is not enabled. We don't support
 	// multi-network policy for IPAM-less secondary networks either.
 	if util.IsMultiNetworkPoliciesSupportEnabled() {
-		oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
 		oc.retryMultiNetworkPolicies = oc.newRetryFramework(factory.MultiNetworkPolicyType)
 	}
 }

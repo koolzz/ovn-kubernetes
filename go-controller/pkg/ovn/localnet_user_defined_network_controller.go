@@ -341,11 +341,12 @@ func (oc *LocalnetUserDefinedNetworkController) initRetryFramework() {
 		oc.retryIPAMClaims = oc.newRetryFramework(factory.IPAMClaimsType)
 	}
 
-	// For secondary networks, we don't have to watch namespace events if
-	// multi-network policy support is not enabled. We don't support
+	// For secondary networks, we don't have to watch network-policy-shaped
+	// events if multi-network policy support is not enabled. We don't support
 	// multi-network policy for IPAM-less secondary networks either.
+	// Namespace handling flows through the shared NamespaceController; see
+	// registerNamespaceReconciler in run().
 	if util.IsMultiNetworkPoliciesSupportEnabled() {
-		oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
 		oc.retryMultiNetworkPolicies = oc.newRetryFramework(factory.MultiNetworkPolicyType)
 	}
 }
