@@ -19,6 +19,7 @@ import (
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/allocator/pod"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	nscontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/namespace"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/generator/udn"
@@ -212,6 +213,7 @@ func NewLayer3UserDefinedNetworkController(
 	portCache *PortCache,
 	addressSetManager *addresssetmanager.AddressSetManager,
 	nodeReconciler *nodecontroller.NodeController,
+	nsReconciler *nscontroller.NamespaceController,
 ) (*Layer3UserDefinedNetworkController, error) {
 
 	stopChan := make(chan struct{})
@@ -245,6 +247,7 @@ func NewLayer3UserDefinedNetworkController(
 				addressSetManager:           addressSetManager,
 				nodeReconciler:              nodeReconciler,
 				nodeAnnotationCache:         nodeAnnotationCache,
+				nsReconciler:                nsReconciler,
 			},
 		},
 		mgmtPortFailed:              sync.Map{},
