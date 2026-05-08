@@ -374,6 +374,7 @@ func (oc *Layer3UserDefinedNetworkController) Stop() {
 	}
 	klog.Infof("Stop %s UDN controller of network %s", oc.TopologyType(), oc.GetNetworkName())
 	oc.DeregisterNodeHandler()
+	oc.DeregisterNamespaceHandler()
 	close(oc.stopChan)
 	oc.stopChan = nil
 	oc.cancelableCtx.Cancel()
@@ -512,9 +513,11 @@ func (oc *Layer3UserDefinedNetworkController) run() error {
 	klog.Infof("Starting all the Watchers for network %s ...", oc.GetNetworkName())
 	start := time.Now()
 
-	// WatchNamespaces() should be started first because it has no other
-	// dependencies.
-	if err := oc.WatchNamespaces(); err != nil {
+	// Namespace handling now flows through the shared NamespaceController.
+	// Registration triggers a synchronous bootstrap pass (SyncNamespaces +
+	// per-ns reconciles enqueued from the informer cache) before this
+	// returns, matching the ordering contract WatchNamespaces had.
+	if err := oc.registerNamespaceReconciler(oc); err != nil {
 		return err
 	}
 

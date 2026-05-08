@@ -311,6 +311,33 @@ func (oc *BaseNetworkController) DeregisterNamespaceHandler() {
 	oc.nsReconciler.DeregisterNetworkController(oc.GetNetworkName())
 }
 
+// registerNamespaceReconciler wires the given handler into the shared
+// NamespaceController. Mirrors the gate that legacy WatchNamespaces
+// used: networks that don't need namespace events (e.g. a secondary
+// network with multi-netpol disabled) skip registration entirely.
+//
+// Synchronous bootstrap contract: RegisterNetworkController only
+// SyncNamespaces + enqueues per-namespace reconciles; it does NOT
+// wait for the workqueue to drain. Dependent watchers (NetworkPolicy,
+// Pods) MUST see a fully-applied namespace cache before they start —
+// otherwise a NetworkPolicy add can race the namespace's
+// AddNamespace, miss the port group, fail to attach, and stay
+// unenforced until retry. Block here on WaitForBootstrap to preserve
+// the legacy WatchNamespaces ordering contract.
+func (oc *BaseNetworkController) registerNamespaceReconciler(handler nscontroller.NamespaceHandler) error {
+	if !oc.shouldWatchNamespaces() {
+		klog.Infof("Ignoring namespaces events for network: %s", oc.GetNetworkName())
+		return nil
+	}
+	if err := oc.nsReconciler.RegisterNetworkController(handler); err != nil {
+		return err
+	}
+	if err := oc.nsReconciler.WaitForBootstrap(oc.GetNetworkName(), 30*time.Second); err != nil {
+		return fmt.Errorf("namespace bootstrap drain failed for network %s: %w", oc.GetNetworkName(), err)
+	}
+	return nil
+}
+
 // BaseUserDefinedNetworkController structure holds per-network fields and network specific
 // configuration for UDN controller
 type BaseUserDefinedNetworkController struct {

@@ -690,14 +690,15 @@ func (oc *DefaultNetworkController) run(_ context.Context) error {
 	start := time.Now()
 
 	// Namespace handling for the default network now flows through the
-	// shared NamespaceController (Phase 3a). Registering the handler
-	// triggers a synchronous bootstrap pass — SyncNamespaces is run
-	// against the current informer list, and per-ns reconciles are
-	// enqueued — before this returns. Same ordering contract the legacy
-	// WatchNamespaces had, so node startup (which depends on namespaces)
-	// continues to see a fully-bootstrapped namespace cache.
+	// shared NamespaceController (Phase 3a). registerNamespaceReconciler
+	// runs SyncNamespaces, enqueues per-ns reconciles, AND blocks on
+	// WaitForBootstrap so the legacy WatchNamespaces ordering contract
+	// holds — node startup, WatchPods, and WatchNetworkPolicy below all
+	// see a fully-applied namespace cache before they start. Without
+	// the drain, a NetworkPolicy add could race the namespace's
+	// AddNamespace, miss the port group, and stay unenforced.
 	if err := WithSyncDurationMetric("namespace", func() error {
-		return oc.nsReconciler.RegisterNetworkController(oc)
+		return oc.registerNamespaceReconciler(oc)
 	}); err != nil {
 		return err
 	}
