@@ -350,24 +350,18 @@ type BaseUserDefinedNetworkController struct {
 }
 
 func (oc *BaseUserDefinedNetworkController) FilterOutResource(objType reflect.Type, obj interface{}) bool {
-	switch objType {
-	case factory.NamespaceType:
-		ns, ok := obj.(*corev1.Namespace)
-		if !ok {
-			klog.Errorf("Failed to cast the provided object to a namespace")
-			return false
-		}
-		return oc.shouldFilterNamespace(ns.Name)
-	case factory.PodType:
+	// Namespace events flow through the shared NamespaceController and
+	// are filtered there; only the per-network retry framework's
+	// remaining types (currently PodType) need filtering here.
+	if objType == factory.PodType {
 		pod, ok := obj.(*corev1.Pod)
 		if !ok {
 			klog.Errorf("Failed to cast the provided object to a pod")
 			return false
 		}
 		return oc.shouldFilterNamespace(pod.GetNamespace())
-	default:
-		return false
 	}
+	return false
 }
 
 func (oc *BaseUserDefinedNetworkController) shouldFilterNamespace(namespace string) bool {

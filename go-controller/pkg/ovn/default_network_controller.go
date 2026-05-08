@@ -1133,13 +1133,6 @@ func (h *defaultNetworkControllerEventHandler) AddResource(obj interface{}, from
 		}
 		return nil
 
-	case factory.NamespaceType:
-		ns, ok := obj.(*corev1.Namespace)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *corev1.Namespace", obj)
-		}
-		return h.oc.AddNamespace(ns)
-
 	default:
 		return h.oc.AddResourceCommon(h.objType, obj)
 	}
@@ -1210,10 +1203,6 @@ func (h *defaultNetworkControllerEventHandler) UpdateResource(oldObj, newObj int
 			h.oc.syncEIPNodeFailed.Delete(newNode.Name)
 		}
 		return nil
-
-	case factory.NamespaceType:
-		oldNs, newNs := oldObj.(*corev1.Namespace), newObj.(*corev1.Namespace)
-		return h.oc.updateNamespace(oldNs, newNs)
 	}
 	return fmt.Errorf("no update function for object type %s", h.objType)
 }
@@ -1259,10 +1248,6 @@ func (h *defaultNetworkControllerEventHandler) DeleteResource(obj, cachedObj int
 		h.oc.syncEIPNodeFailed.Delete(node.Name)
 		return nil
 
-	case factory.NamespaceType:
-		ns := obj.(*corev1.Namespace)
-		return h.oc.deleteNamespace(ns)
-
 	default:
 		return h.oc.DeleteResourceCommon(h.objType, obj)
 	}
@@ -1291,9 +1276,6 @@ func (h *defaultNetworkControllerEventHandler) SyncFunc(objs []interface{}) erro
 		case factory.EgressIPNamespaceType,
 			factory.EgressIPType:
 			syncFunc = nil
-
-		case factory.NamespaceType:
-			syncFunc = h.oc.syncNamespaces
 
 		default:
 			return fmt.Errorf("no sync function for object type %s", h.objType)
