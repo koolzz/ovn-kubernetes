@@ -91,64 +91,14 @@ func (oc *DefaultNetworkController) addPodExternalGW(pod *corev1.Pod) error {
 	return nil
 }
 
-// addPodExternalGWForNamespace handles adding routes to all pods in that namespace for a pod GW
+// addPodExternalGWForNamespace handles adding routes to all pods in that namespace for a pod GW.
+// gatewayPodIndex has already been updated at the top of addPodExternalGW, so reconcile sees the
+// post-add view. Side effects (annotation patch / conntrack flush) fire from inside reconcile.
 func (oc *DefaultNetworkController) addPodExternalGWForNamespace(namespace string, pod *corev1.Pod, egress gatewayInfo) error {
-	nsInfo, nsUnlock, err := oc.ensureNamespaceLocked(namespace, false, nil)
-	if err != nil {
-		return fmt.Errorf("failed to ensure namespace locked: %v", err)
-	}
-	// The duplicate-IP validation that used to live here
-	// (validateRoutingPodGWs) is incompatible with the new
-	// OR-on-collision merge for gateway-pod GWs in the same namespace —
-	// duplicates are explicitly allowed and merge their BFD flags. The
-	// caller (addPodExternalGW) has already updated gatewayPodIndex at
-	// the top, so the post-add view is available.
-	existingGWs := sets.NewString()
-	if oc.gatewayPodIndex != nil {
-		for ip := range oc.gatewayPodIndex.GatewaysForNamespace(namespace) {
-			existingGWs.Insert(ip)
-		}
-	}
-	if config.OVNKubernetesFeature.EnableInterconnect && oc.zone != types.OvnDefaultZone {
-		existingGWs.Insert(nsInfo.routingExternalGWs.gws.UnsortedList()...)
-	}
-	nsUnlock()
-
 	klog.Infof("Adding routes for external gateway pod: %s, next hops: %q, namespace: %s, bfd-enabled: %t",
 		pod.Name, strings.Join(egress.gws.UnsortedList(), ","), namespace, egress.bfdEnabled)
-	// Drive route programming through the namespace-level apply
-	// primitive. It reads desired state from (annotation +
-	// gatewayPodIndex) — the index has already been updated at the
-	// top of addPodExternalGW — and reconciles against the snapshot.
-	// This handles the duplicate-contributor case correctly: if two
-	// gateway pods contribute the same IP, deleting one leaves the
-	// route in place because the other still desires it.
-	err = oc.reconcileGWStateForNamespace(namespace)
-	if err != nil {
-		return err
-	}
-	// add the exgw podIP to the namespace's k8s.ovn.org/external-gw-pod-ips list
-	if !config.OVNKubernetesFeature.EnableInterconnect || oc.zone == types.OvnDefaultZone {
-		// If interconnect is disabled OR interconnect is running in single-zone-mode,
-		// the ovnkube-master is responsible for patching ICNI managed namespaces with
-		// "k8s.ovn.org/external-gw-pod-ips". In that case, we need ovnkube-node to flush
-		// conntrack on every node. In multi-zone-interconnect case, we will handle the flushing
-		// directly on the ovnkube-controller code to avoid an extra namespace annotation
-		if err := util.UpdateExternalGatewayPodIPsAnnotation(oc.kube, namespace, existingGWs.List()); err != nil {
-			klog.Errorf("Unable to update %s/%v annotation for namespace %s: %v", util.ExternalGatewayPodIPsAnnotation, existingGWs, namespace, err)
-		}
-	} else {
-		// flush here since we know we have added an egressgw pod and we also know the full list of existing gatewayIPs
-		gatewayIPs, err := oc.apbExternalRouteController.GetAdminPolicyBasedExternalRouteIPsForTargetNamespace(namespace)
-		if err != nil {
-			return fmt.Errorf("unable to retrieve gateway IPs for Admin Policy Based External Route objects: %w", err)
-		}
-		gatewayIPs = gatewayIPs.Insert(existingGWs.List()...)
-		err = oc.syncConntrackForExternalGateways(namespace, gatewayIPs) // best effort
-		if err != nil {
-			klog.Errorf("Syncing conntrack entries for egressGW pod %v serving the namespace %s failed: %v",
-				egress, namespace, err)
-		}
+	if err := oc.reconcileGWStateForNamespace(namespace); err != nil {
+		return fmt.Errorf("failed to reconcile GW state for pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	return nil
 }
@@ -380,61 +330,17 @@ func (oc *DefaultNetworkController) deletePodExternalGW(pod *corev1.Pod) (err er
 	return nil
 }
 
-// deletePodGwRoutesForNamespace handles deleting all routes in a namespace for a specific pod GW
+// deletePodGwRoutesForNamespace handles deleting all routes in a namespace for a specific pod GW.
+// gatewayPodIndex has already been Delete'd at the top of deletePodExternalGW, so reconcile sees
+// the post-delete view. Side effects (annotation patch / conntrack flush) fire from inside reconcile.
 func (oc *DefaultNetworkController) deletePodGWRoutesForNamespace(pod *corev1.Pod, namespace string) (err error) {
 	nsInfo, nsUnlock := oc.getNamespaceLocked(namespace, false)
 	if nsInfo == nil {
 		return nil
 	}
-	// Post-delete merged GW set comes from gatewayPodIndex. The
-	// gatewayPodIndex.Delete at the top of deletePodExternalGW has
-	// already evicted the pod, so this read reflects the post-delete
-	// view. Annotation-derived ns GWs still live on nsInfo.
-	existingGWs := sets.New[string]()
-	if oc.gatewayPodIndex != nil {
-		for ip := range oc.gatewayPodIndex.GatewaysForNamespace(namespace) {
-			existingGWs.Insert(ip)
-		}
-	}
-	if config.OVNKubernetesFeature.EnableInterconnect && oc.zone != types.OvnDefaultZone {
-		existingGWs.Insert(nsInfo.routingExternalGWs.gws.UnsortedList()...)
-	}
 	nsUnlock()
-
-	// Drive route teardown through the namespace-level apply
-	// primitive. The pod has already been removed from the index, so
-	// reconcile will compute desired state without this pod's
-	// contribution and emit deletes only for IPs no longer desired by
-	// any source. This is strictly more correct than the legacy
-	// "delete every IP this pod was contributing" approach, which
-	// would drop a duplicate-contributor IP that other sources still
-	// wanted. Idempotent under retry — the index is already
-	// post-delete, so re-driving the caller converges without duplication.
 	if err := oc.reconcileGWStateForNamespace(namespace); err != nil {
 		return fmt.Errorf("failed to reconcile GW state for pod %s deletion: %w", pod.Name, err)
-	}
-	// remove the exgw podIP from the namespace's k8s.ovn.org/external-gw-pod-ips list
-	if !config.OVNKubernetesFeature.EnableInterconnect || oc.zone == types.OvnDefaultZone {
-		// If interconnect is disabled OR interconnect is running in single-zone-mode,
-		// the ovnkube-master is responsible for patching ICNI managed namespaces with
-		// "k8s.ovn.org/external-gw-pod-ips". In that case, we need ovnkube-node to flush
-		// conntrack on every node. In multi-zone-interconnect case, we will handle the flushing
-		// directly on the ovnkube-controller code to avoid an extra namespace annotation
-		if err := util.UpdateExternalGatewayPodIPsAnnotation(oc.kube, namespace, sets.List(existingGWs)); err != nil {
-			klog.Errorf("Unable to update %s/%v annotation for namespace %s: %v", util.ExternalGatewayPodIPsAnnotation, existingGWs, namespace, err)
-		}
-	} else {
-		// flush here since we know we have deleted an egressgw pod and we also know the full list of existing gatewayIPs
-		gatewayIPs, err := oc.apbExternalRouteController.GetAdminPolicyBasedExternalRouteIPsForTargetNamespace(namespace)
-		if err != nil {
-			return fmt.Errorf("unable to retrieve gateway IPs for Admin Policy Based External Route objects: %w", err)
-		}
-		gatewayIPs = gatewayIPs.Insert(sets.List(existingGWs)...)
-		err = oc.syncConntrackForExternalGateways(namespace, gatewayIPs) // best effort
-		if err != nil {
-			klog.Errorf("Syncing conntrack entries for egressGWs %+v serving the namespace %s failed: %v",
-				gatewayIPs, namespace, err)
-		}
 	}
 	return nil
 }

@@ -183,33 +183,12 @@ func (oc *DefaultNetworkController) updateNamespace(old, newer *corev1.Namespace
 		} else {
 			errors = append(errors, err)
 		}
+		// reconcileGWStateForNamespace drives both the route deltas and
+		// the IC-mode-specific side effects (annotation patch /
+		// conntrack flush) — see applyGWStateSideEffects in
+		// gw_state_reconcile.go.
 		if err := oc.reconcileGWStateForNamespace(old.Name); err != nil {
 			errors = append(errors, fmt.Errorf("failed to apply gateway state for namespace %s: %v", old.Name, err))
-		}
-		if config.OVNKubernetesFeature.EnableInterconnect && oc.zone != types.OvnDefaultZone {
-			// If interconnect is disabled OR interconnect is running in single-zone-mode,
-			// the ovnkube-master is responsible for patching ICNI managed namespaces with
-			// "k8s.ovn.org/external-gw-pod-ips". In that case, we need ovnkube-node to flush
-			// conntrack on every node. In multi-zone-interconnect case, we will handle the flushing
-			// directly on the ovnkube-controller code to avoid an extra namespace annotation
-			gatewayIPs, err := oc.apbExternalRouteController.GetAdminPolicyBasedExternalRouteIPsForTargetNamespace(old.Name)
-			if err != nil {
-				return fmt.Errorf("unable to retrieve gateway IPs for Admin Policy Based External Route objects for namespace %s: %w", old.Name, err)
-			}
-			// Gateway-pod GWs come from gatewayPodIndex (Phase 1b
-			// source of truth). Annotation-derived ns GWs still live
-			// on nsInfo until later substeps.
-			if oc.gatewayPodIndex != nil {
-				for ip := range oc.gatewayPodIndex.GatewaysForNamespace(old.Name) {
-					gatewayIPs.Insert(ip)
-				}
-			}
-			gatewayIPs.Insert(nsInfo.routingExternalGWs.gws.UnsortedList()...)
-			err = oc.syncConntrackForExternalGateways(old.Name, gatewayIPs) // best effort
-			if err != nil {
-				klog.Errorf("Syncing conntrack entries for egressGWs %+v serving the namespace %s failed: %v",
-					gatewayIPs, old.Name, err)
-			}
 		}
 		// if new annotation is empty, exgws were removed, may need to add SNAT per pod
 		// check if there are any pod gateways serving this namespace as well
