@@ -185,16 +185,12 @@ func (oc *DefaultNetworkController) updateNamespace(old, newer *corev1.Namespace
 			if err != nil {
 				return fmt.Errorf("unable to retrieve gateway IPs for Admin Policy Based External Route objects for namespace %s: %w", old.Name, err)
 			}
-			// Gateway-pod GWs come from gatewayPodIndex (Phase 1b source
-			// of truth). Annotation-derived ns GWs still live on
-			// nsInfo until later substeps.
+			// Gateway-pod GWs come from gatewayPodIndex (Phase 1b
+			// source of truth). Annotation-derived ns GWs still live
+			// on nsInfo until later substeps.
 			if oc.gatewayPodIndex != nil {
 				for ip := range oc.gatewayPodIndex.GatewaysForNamespace(old.Name) {
 					gatewayIPs.Insert(ip)
-				}
-			} else {
-				for _, gwInfo := range nsInfo.routingExternalPodGWs {
-					gatewayIPs.Insert(gwInfo.gws.UnsortedList()...)
 				}
 			}
 			gatewayIPs.Insert(nsInfo.routingExternalGWs.gws.UnsortedList()...)
@@ -206,7 +202,7 @@ func (oc *DefaultNetworkController) updateNamespace(old, newer *corev1.Namespace
 		}
 		// if new annotation is empty, exgws were removed, may need to add SNAT per pod
 		// check if there are any pod gateways serving this namespace as well
-		hasPodGWs := len(nsInfo.routingExternalPodGWs) > 0
+		hasPodGWs := false
 		if oc.gatewayPodIndex != nil {
 			hasPodGWs = len(oc.gatewayPodIndex.PodsForNamespace(old.Name)) > 0
 		}

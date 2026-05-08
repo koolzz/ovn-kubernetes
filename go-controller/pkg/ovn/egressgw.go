@@ -101,21 +101,12 @@ func (oc *DefaultNetworkController) addPodExternalGWForNamespace(namespace strin
 	// (validateRoutingPodGWs) is incompatible with the new
 	// OR-on-collision merge for gateway-pod GWs in the same namespace —
 	// duplicates are explicitly allowed and merge their BFD flags. The
-	// caller (addPodExternalGW) has already updated gatewayPodIndex
-	// shadow-write at the top, so the post-add view is available.
-	nsInfo.routingExternalPodGWs[makePodGWKey(pod)] = egress
+	// caller (addPodExternalGW) has already updated gatewayPodIndex at
+	// the top, so the post-add view is available.
 	existingGWs := sets.NewString()
-	// Read the post-Update merged GW set from the index. This matches
-	// today's "iterate all gateway-pod entries and union the gws" logic
-	// but reads from the new source of truth. The legacy nsInfo write
-	// above stays for now until the rest of Phase 1b lands.
 	if oc.gatewayPodIndex != nil {
 		for ip := range oc.gatewayPodIndex.GatewaysForNamespace(namespace) {
 			existingGWs.Insert(ip)
-		}
-	} else {
-		for _, gwInfo := range nsInfo.routingExternalPodGWs {
-			existingGWs.Insert(gwInfo.gws.UnsortedList()...)
 		}
 	}
 	if config.OVNKubernetesFeature.EnableInterconnect && oc.zone != types.OvnDefaultZone {
@@ -398,23 +389,16 @@ func (oc *DefaultNetworkController) deletePodGWRoutesForNamespace(pod *corev1.Po
 	if nsInfo == nil {
 		return nil
 	}
-	podGWKey := makePodGWKey(pod)
 	// Compute the pod's prior gateway IPs directly from its
 	// annotation/network-status. Same data source the index payload was
-	// populated from, so this is byte-identical to what
-	// nsInfo.routingExternalPodGWs[podGWKey] held before its delete —
-	// without needing the legacy state.
+	// populated from, so this is byte-identical to what the legacy
+	// gateway-pod state used to cache — without needing the cache.
 	priorGwIPs, gwIPsErr := getExGwPodIPs(pod)
 	if gwIPsErr != nil {
 		klog.Warningf("Cannot resolve gateway IPs for delete on pod %s/%s: %v", pod.Namespace, pod.Name, gwIPsErr)
 	}
 	_, bfdEnabled := pod.Annotations[util.BfdAnnotation]
 	foundGws := gatewayInfo{gws: priorGwIPs, bfdEnabled: bfdEnabled}
-	// Drop the legacy nsInfo entry too while we're here. nsInfo is no
-	// longer authoritative for gateway-pod state but is still being
-	// double-written; this keeps the two stores in lockstep until the
-	// legacy field is dropped in 1b.9.
-	delete(nsInfo.routingExternalPodGWs, podGWKey)
 	// Post-delete merged GW set comes from gatewayPodIndex. The
 	// gatewayPodIndex.Delete at the top of deletePodExternalGW has
 	// already evicted the pod, so this read reflects the post-delete

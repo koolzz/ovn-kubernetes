@@ -41,10 +41,9 @@ type namespaceInfo struct {
 	// annotation k8s.ovn.org/routing-external-gws
 	routingExternalGWs gatewayInfo
 
-	// routingExternalPodGWs contains a map of all pods serving as exgws as well as their
-	// exgw IPs
-	// key is <namespace>_<pod name>
-	routingExternalPodGWs map[string]gatewayInfo
+	// gateway-pod state (formerly routingExternalPodGWs) lives in
+	// DefaultNetworkController.gatewayPodIndex; UDN controllers do not
+	// have gateway pods. See namespace-migration-plan.md Phase 1b.
 
 	multicastEnabled bool
 
@@ -228,9 +227,8 @@ func (bnc *BaseNetworkController) ensureNamespaceLockedCommon(ns string, readOnl
 	nsInfoExisted := false
 	if nsInfo == nil {
 		nsInfo = &namespaceInfo{
-			multicastEnabled:      false,
-			routingExternalPodGWs: make(map[string]gatewayInfo),
-			routingExternalGWs:    gatewayInfo{gws: sets.New[string](), bfdEnabled: false},
+			multicastEnabled:   false,
+			routingExternalGWs: gatewayInfo{gws: sets.New[string](), bfdEnabled: false},
 		}
 		// we are creating nsInfo and going to set it in namespaces map
 		// so safe to hold the lock while we create and add it
@@ -350,25 +348,6 @@ func (bnc *BaseNetworkController) GetNamespaceExternalGWs(ns string) gatewayInfo
 		gws:        sets.New(nsInfo.routingExternalGWs.gws.UnsortedList()...),
 		bfdEnabled: nsInfo.routingExternalGWs.bfdEnabled,
 	}
-}
-
-// GetNamespaceExternalPodGWs returns a deep copy of the namespace's
-// gateway-pod-derived gateway info map. Returns an empty map if the
-// namespace is unknown.
-func (bnc *BaseNetworkController) GetNamespaceExternalPodGWs(ns string) map[string]gatewayInfo {
-	nsInfo, nsUnlock := bnc.getNamespaceLocked(ns, true)
-	if nsInfo == nil {
-		return map[string]gatewayInfo{}
-	}
-	defer nsUnlock()
-	out := make(map[string]gatewayInfo, len(nsInfo.routingExternalPodGWs))
-	for k, v := range nsInfo.routingExternalPodGWs {
-		out[k] = gatewayInfo{
-			gws:        sets.New(v.gws.UnsortedList()...),
-			bfdEnabled: v.bfdEnabled,
-		}
-	}
-	return out
 }
 
 // GetNamespaceMulticastEnabled returns whether multicast is currently

@@ -143,12 +143,10 @@ type DefaultNetworkController struct {
 	gatewayTopologyFactory *topology.GatewayTopologyFactory
 
 	// gatewayPodIndex tracks "which gateway pods serve which namespaces"
-	// for the multi-external-gateway feature. Source of truth is being
-	// migrated here from nsInfo.routingExternalPodGWs in phased
-	// substeps. Currently shadow-written: the legacy nsInfo state is
-	// still authoritative; this index is kept in sync so future
-	// substeps can flip readers over one at a time. See
-	// gateway_pod_index.go and namespace-migration-plan.md Phase 1b.
+	// for the multi-external-gateway feature. Sole source of truth as
+	// of Phase 1b. Bootstrapped from the pod informer cache before
+	// WatchPods runs (see bootstrapGatewayPodIndex); HasSynced() gates
+	// any reader that depends on the index for correctness.
 	gatewayPodIndex *gatewayPodIndex
 }
 

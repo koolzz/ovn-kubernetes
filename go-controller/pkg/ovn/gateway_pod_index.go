@@ -349,10 +349,9 @@ func (g *gatewayPodIndex) PodsForNamespace(ns string) []string {
 }
 
 // PerPodGatewaysForNamespace returns a per-gateway-pod view of the
-// gateways serving the namespace, keyed by gateway-pod key. The shape
-// matches the legacy nsInfo.routingExternalPodGWs (map[podKey]gatewayInfo)
-// so callers swapping from nsInfo to the index don't need to reshape
-// downstream code. Only payloads with active==true are included.
+// gateways serving the namespace, keyed by gateway-pod key (matches
+// the historic map[podKey]gatewayInfo shape). Only payloads with
+// active==true are included.
 //
 // Returns a fresh map; values' gws sets are independent copies.
 func (g *gatewayPodIndex) PerPodGatewaysForNamespace(ns string) map[string]gatewayInfo {
