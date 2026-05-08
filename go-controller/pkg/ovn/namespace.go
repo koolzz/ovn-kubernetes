@@ -185,8 +185,17 @@ func (oc *DefaultNetworkController) updateNamespace(old, newer *corev1.Namespace
 			if err != nil {
 				return fmt.Errorf("unable to retrieve gateway IPs for Admin Policy Based External Route objects for namespace %s: %w", old.Name, err)
 			}
-			for _, gwInfo := range nsInfo.routingExternalPodGWs {
-				gatewayIPs.Insert(gwInfo.gws.UnsortedList()...)
+			// Gateway-pod GWs come from gatewayPodIndex (Phase 1b source
+			// of truth). Annotation-derived ns GWs still live on
+			// nsInfo until later substeps.
+			if oc.gatewayPodIndex != nil {
+				for ip := range oc.gatewayPodIndex.GatewaysForNamespace(old.Name) {
+					gatewayIPs.Insert(ip)
+				}
+			} else {
+				for _, gwInfo := range nsInfo.routingExternalPodGWs {
+					gatewayIPs.Insert(gwInfo.gws.UnsortedList()...)
+				}
 			}
 			gatewayIPs.Insert(nsInfo.routingExternalGWs.gws.UnsortedList()...)
 			err = oc.syncConntrackForExternalGateways(old.Name, gatewayIPs) // best effort
@@ -197,7 +206,11 @@ func (oc *DefaultNetworkController) updateNamespace(old, newer *corev1.Namespace
 		}
 		// if new annotation is empty, exgws were removed, may need to add SNAT per pod
 		// check if there are any pod gateways serving this namespace as well
-		if gwAnnotation == "" && len(nsInfo.routingExternalPodGWs) == 0 && config.Gateway.DisableSNATMultipleGWs {
+		hasPodGWs := len(nsInfo.routingExternalPodGWs) > 0
+		if oc.gatewayPodIndex != nil {
+			hasPodGWs = len(oc.gatewayPodIndex.PodsForNamespace(old.Name)) > 0
+		}
+		if gwAnnotation == "" && !hasPodGWs && config.Gateway.DisableSNATMultipleGWs {
 			existingPods, err := oc.watchFactory.GetPods(old.Name)
 			if err != nil {
 				errors = append(errors, fmt.Errorf("failed to get all the pods (%v)", err))
