@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	ref "k8s.io/client-go/tools/reference"
 	"k8s.io/klog/v2"
@@ -309,6 +310,40 @@ func (oc *BaseNetworkController) DeregisterNamespaceHandler() {
 		return
 	}
 	oc.nsReconciler.DeregisterNetworkController(oc.GetNetworkName())
+}
+
+// ReconcilePod re-enqueues the pod identified by key (namespace/name)
+// for the existing pod-add path. Reads the pod from the informer
+// cache and drives it through retryPods.AddRetryObjWithAddNoBackoff,
+// then signals the retry loop to iterate. Callers fan out per-namespace
+// pod sets through this entry point instead of walking pods inline,
+// which keeps the per-pod work owned by the pod controller and makes
+// the namespace reconcile shape level-driven.
+//
+// Returns nil for a key whose pod is gone from the informer (no work
+// needed) and for a malformed key (logged but not propagated, since
+// the caller is typically driving best-effort fan-out).
+func (oc *BaseNetworkController) ReconcilePod(podKey string) error {
+	if oc.retryPods == nil {
+		return nil
+	}
+	namespace, name, err := cache.SplitMetaNamespaceKey(podKey)
+	if err != nil {
+		klog.Errorf("ReconcilePod: invalid pod key %q: %v", podKey, err)
+		return nil
+	}
+	pod, err := oc.watchFactory.GetPod(namespace, name)
+	if err != nil {
+		// Pod gone from the informer cache; no reconcile needed. The
+		// pod handler's delete path has already (or will) tear down
+		// the OVN state via the standard event flow.
+		return nil
+	}
+	if err := oc.retryPods.AddRetryObjWithAddNoBackoff(pod); err != nil {
+		return fmt.Errorf("ReconcilePod: failed to enqueue pod %s: %w", podKey, err)
+	}
+	oc.retryPods.RequestRetryObjs()
+	return nil
 }
 
 // registerNamespaceReconciler wires the given handler into the shared
