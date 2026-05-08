@@ -5,13 +5,17 @@ package ovn
 
 import (
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	ktypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 )
@@ -175,4 +179,146 @@ func (oc *DefaultNetworkController) addRoutesForNamespace(ns string, info gatewa
 // Adapter to the existing deleteGWRoutesForNamespace primitive.
 func (oc *DefaultNetworkController) deleteRoutesForNamespace(ns string, matchGWs sets.Set[string]) error {
 	return oc.deleteGWRoutesForNamespace(ns, matchGWs)
+}
+
+// bootstrapNSAppliedGWState seeds the per-namespace applied-state
+// snapshot AND the externalGatewayRouteInfo cache from NBDB at
+// controller startup. Both caches are required for a restart-safe
+// delete leg:
+//
+//   - nsAppliedGWState[ns] tells the namespace reconcile what routes
+//     are currently programmed, so the diff against desired state
+//     produces a correct delete delta when an annotation was cleared
+//     during downtime.
+//   - externalGatewayRouteInfo[podKey] is what deleteGWRoutesForNamespace
+//     actually walks. Without it, the delete delta computed above would
+//     fire but the cache walk would visit no pods, leaving the stale
+//     NBDB routes in place permanently (the cache only repopulates on
+//     pod-add, and pod-add no longer fires for already-running pods).
+//
+// Walks every gateway-pod-style logical-router static-route the
+// addGWRoutesForPod primitive creates (policy=src-ip,
+// ecmp_symmetric_reply=true, OutputPort matching the rtoe- prefix),
+// resolves each route's pod IP to (namespace, pod name) via the
+// informer, and seeds both caches with (gw IP, BFD-enabled, GR name).
+// Routes whose pod IP is no longer in the informer are skipped —
+// they're orphans that the per-namespace reconcile will cover once a
+// real namespace event fires for any name they belong to.
+func (oc *DefaultNetworkController) bootstrapNSAppliedGWState() error {
+	if oc.nsAppliedGWState == nil {
+		oc.nsAppliedGWState = newNSAppliedGWState()
+	}
+	pods, err := oc.watchFactory.GetAllPods()
+	if err != nil {
+		return fmt.Errorf("failed to list pods for nsAppliedGWState bootstrap: %w", err)
+	}
+	// Build podIP → (namespace, pod) so we can seed both caches in
+	// one pass. The previous version only kept the namespace, which
+	// was enough for nsAppliedGWState but left externalGatewayRouteInfo
+	// unseeded — its key is the pod's NamespacedName.
+	podIPToPod := map[string]ktypes.NamespacedName{}
+	for _, pod := range pods {
+		if pod.Spec.HostNetwork {
+			continue
+		}
+		key := ktypes.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+		for _, podIP := range pod.Status.PodIPs {
+			podIPToPod[podIP.IP] = key
+		}
+	}
+
+	predicate := func(item *nbdb.LogicalRouterStaticRoute) bool {
+		if item.Policy == nil || *item.Policy != nbdb.LogicalRouterStaticRoutePolicySrcIP {
+			return false
+		}
+		if item.Options["ecmp_symmetric_reply"] != "true" {
+			return false
+		}
+		if item.OutputPort == nil {
+			return false
+		}
+		return strings.Contains(*item.OutputPort, types.GWRouterToExtSwitchPrefix)
+	}
+	routes, err := libovsdbops.FindLogicalRouterStaticRoutesWithPredicate(oc.nbClient, predicate)
+	if err != nil {
+		return fmt.Errorf("failed to find gateway-pod static routes for bootstrap: %w", err)
+	}
+
+	seedGWStateFromRoutes(routes, podIPToPod, oc.nsAppliedGWState, oc.externalGatewayRouteInfo)
+	return nil
+}
+
+// seedGWStateFromRoutes is the pure-function core of
+// bootstrapNSAppliedGWState. Given a list of gateway-pod static routes
+// and the current podIP → (namespace, pod) map, populates the
+// applied-state snapshot (per namespace) and the gateway-route cache
+// (per pod). Both must be seeded together: nsAppliedGWState drives the
+// delete diff, externalGatewayRouteInfo drives the actual NBDB cleanup
+// walk. Seeding one without the other leaves the cleanup half-done
+// after a restart.
+//
+// Extracted from the bootstrap method so it's unit-testable without a
+// real nbClient or watchFactory.
+func seedGWStateFromRoutes(
+	routes []*nbdb.LogicalRouterStaticRoute,
+	podIPToPod map[string]ktypes.NamespacedName,
+	applied *nsAppliedGWState,
+	routeCache *apbroutecontroller.ExternalGatewayRouteInfoCache,
+) {
+	perNS := map[string]*desiredGWState{}
+	orphans := 0
+	for _, route := range routes {
+		podIP := route.IPPrefix
+		if idx := strings.IndexByte(podIP, '/'); idx > 0 {
+			podIP = podIP[:idx]
+		}
+		podKey, ok := podIPToPod[podIP]
+		if !ok {
+			orphans++
+			continue
+		}
+		ns := podKey.Namespace
+
+		if perNS[ns] == nil {
+			perNS[ns] = newDesiredGWState()
+		}
+		bfd := route.BFD != nil && *route.BFD != ""
+		perNS[ns].addGW(route.Nexthop, bfd)
+
+		if routeCache == nil || route.OutputPort == nil {
+			continue
+		}
+		gr := grNameFromOutputPort(*route.OutputPort)
+		if gr == "" {
+			continue
+		}
+		_ = routeCache.CreateOrLoad(podKey, func(routeInfo *apbroutecontroller.RouteInfo) error {
+			if routeInfo.PodExternalRoutes[podIP] == nil {
+				routeInfo.PodExternalRoutes[podIP] = map[string]string{}
+			}
+			routeInfo.PodExternalRoutes[podIP][route.Nexthop] = gr
+			return nil
+		})
+	}
+
+	if applied != nil {
+		for ns, state := range perNS {
+			applied.Set(ns, state)
+		}
+	}
+	klog.Infof("Bootstrapped nsAppliedGWState from NBDB: %d namespaces seeded, %d total routes, %d orphans",
+		len(perNS), len(routes), orphans)
+}
+
+// grNameFromOutputPort extracts the gateway-router name from a static
+// route's OutputPort, shaped "<portPrefix>rtoe-<grName>". Returns ""
+// if the rtoe- segment isn't present (the bootstrap predicate already
+// guarantees its presence; the empty return is defensive against
+// future predicate changes).
+func grNameFromOutputPort(outputPort string) string {
+	idx := strings.LastIndex(outputPort, types.GWRouterToExtSwitchPrefix)
+	if idx < 0 {
+		return ""
+	}
+	return outputPort[idx+len(types.GWRouterToExtSwitchPrefix):]
 }

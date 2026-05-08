@@ -707,6 +707,23 @@ func (oc *DefaultNetworkController) run(_ context.Context) error {
 	klog.Info("Starting all the Watchers...")
 	start := time.Now()
 
+	// Prime the gateway-pod index from the informer cache before any
+	// per-namespace reconcile fires; namespace reconcile reads
+	// (annotation + index) to compute desired gateway state, and an
+	// empty index would yield an incomplete desired-state diff.
+	if err := oc.bootstrapGatewayPodIndex(); err != nil {
+		return fmt.Errorf("failed to bootstrap gateway-pod index: %w", err)
+	}
+	// Seed nsAppliedGWState from NBDB so the first per-namespace
+	// reconcile after restart sees the real applied state, not an
+	// empty snapshot. Without this seeding, a namespace whose
+	// annotation has been cleared while the controller was down would
+	// have desired=empty and applied=empty — no delete delta fires and
+	// stale OVN gateway routes leak forever.
+	if err := oc.bootstrapNSAppliedGWState(); err != nil {
+		return fmt.Errorf("failed to bootstrap ns applied gateway state: %w", err)
+	}
+
 	// Namespace handling for the default network now flows through the
 	// shared NamespaceController (Phase 3a). registerNamespaceReconciler
 	// runs SyncNamespaces, enqueues per-ns reconciles, AND blocks on
@@ -735,17 +752,6 @@ func (oc *DefaultNetworkController) run(_ context.Context) error {
 	metrics.MetricOVNKubeControllerSyncDuration.WithLabelValues("service").Set(endSvc.Seconds())
 	if err != nil {
 		return err
-	}
-
-	// Prime the gateway-pod index from the informer cache before pod
-	// events start firing. Namespace reconcile gates on
-	// gatewayPodIndex.HasSynced() before reading the index so a
-	// controller restart with stale OVN routes doesn't compute an empty
-	// desired-state and delete legitimate routes. The index is shadow-
-	// written by the gateway-pod paths today (legacy nsInfo state is
-	// still authoritative); see gateway_pod_index.go.
-	if err := oc.bootstrapGatewayPodIndex(); err != nil {
-		return fmt.Errorf("failed to bootstrap gateway-pod index: %w", err)
 	}
 
 	if err := WithSyncDurationMetric("pod", oc.WatchPods); err != nil {
