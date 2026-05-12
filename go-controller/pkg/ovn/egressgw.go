@@ -175,7 +175,12 @@ func (oc *DefaultNetworkController) addGWRoutesForNamespace(namespace string, eg
 	return nil
 }
 
-func (oc *DefaultNetworkController) createBFDStaticRoute(bfdEnabled bool, gw string, podIP, gr, port, mask string) error {
+// createBFDStaticRouteOps appends the ops needed to create-or-update a
+// gateway-pod-style logical-router static route into the provided ops
+// slice. Separated from createBFDStaticRoute so callers building larger
+// transactions (e.g. applyGWStateDelta's BFD-replace path) can batch
+// add + delete legs into a single TransactAndCheck.
+func (oc *DefaultNetworkController) createBFDStaticRouteOps(ops []ovsdb.Operation, bfdEnabled bool, gw, podIP, gr, port, mask string) ([]ovsdb.Operation, error) {
 	lrsr := nbdb.LogicalRouterStaticRoute{
 		Policy: &nbdb.LogicalRouterStaticRoutePolicySrcIP,
 		Options: map[string]string{
@@ -185,8 +190,6 @@ func (oc *DefaultNetworkController) createBFDStaticRoute(bfdEnabled bool, gw str
 		IPPrefix:   podIP + mask,
 		OutputPort: &port,
 	}
-
-	ops := []ovsdb.Operation{}
 	var err error
 	if bfdEnabled {
 		bfd := nbdb.BFD{
@@ -195,11 +198,10 @@ func (oc *DefaultNetworkController) createBFDStaticRoute(bfdEnabled bool, gw str
 		}
 		ops, err = libovsdbops.CreateOrUpdateBFDOps(oc.nbClient, ops, &bfd)
 		if err != nil {
-			return fmt.Errorf("error creating or updating BFD %+v: %v", bfd, err)
+			return nil, fmt.Errorf("error creating or updating BFD %+v: %v", bfd, err)
 		}
 		lrsr.BFD = &bfd.UUID
 	}
-
 	p := func(item *nbdb.LogicalRouterStaticRoute) bool {
 		return item.IPPrefix == lrsr.IPPrefix &&
 			item.Nexthop == lrsr.Nexthop &&
@@ -210,29 +212,48 @@ func (oc *DefaultNetworkController) createBFDStaticRoute(bfdEnabled bool, gw str
 	ops, err = libovsdbops.CreateOrUpdateLogicalRouterStaticRoutesWithPredicateOps(oc.nbClient, ops, gr, &lrsr, p,
 		&lrsr.Options)
 	if err != nil {
-		return fmt.Errorf("error creating or updating static route %+v on router %s: %v", lrsr, gr, err)
+		return nil, fmt.Errorf("error creating or updating static route %+v on router %s: %v", lrsr, gr, err)
 	}
+	return ops, nil
+}
 
-	_, err = libovsdbops.TransactAndCheck(oc.nbClient, ops)
+func (oc *DefaultNetworkController) createBFDStaticRoute(bfdEnabled bool, gw string, podIP, gr, port, mask string) error {
+	ops, err := oc.createBFDStaticRouteOps(nil, bfdEnabled, gw, podIP, gr, port, mask)
 	if err != nil {
+		return err
+	}
+	if _, err = libovsdbops.TransactAndCheck(oc.nbClient, ops); err != nil {
 		return fmt.Errorf("error transacting static route: %v", err)
 	}
-
 	return nil
 }
 
-func (oc *DefaultNetworkController) deleteLogicalRouterStaticRoute(podIP, mask, gw, gr string) error {
+// deleteLogicalRouterStaticRouteOps appends the ops needed to delete
+// every gateway-pod-style logical-router static route matching
+// (policy=src-ip, ipPrefix=podIP/mask, nexthop=gw) on gr. Separated
+// from deleteLogicalRouterStaticRoute so callers can batch.
+func (oc *DefaultNetworkController) deleteLogicalRouterStaticRouteOps(ops []ovsdb.Operation, podIP, mask, gw, gr string) ([]ovsdb.Operation, error) {
 	p := func(item *nbdb.LogicalRouterStaticRoute) bool {
 		return item.Policy != nil &&
 			*item.Policy == nbdb.LogicalRouterStaticRoutePolicySrcIP &&
 			item.IPPrefix == podIP+mask &&
 			item.Nexthop == gw
 	}
-	err := libovsdbops.DeleteLogicalRouterStaticRoutesWithPredicate(oc.nbClient, gr, p)
+	ops, err := libovsdbops.DeleteLogicalRouterStaticRoutesWithPredicateOps(oc.nbClient, ops, gr, p)
 	if err != nil {
-		return fmt.Errorf("error deleting static route from router %s: %v", gr, err)
+		return nil, fmt.Errorf("error building delete ops for static route on router %s: %v", gr, err)
 	}
+	return ops, nil
+}
 
+func (oc *DefaultNetworkController) deleteLogicalRouterStaticRoute(podIP, mask, gw, gr string) error {
+	ops, err := oc.deleteLogicalRouterStaticRouteOps(nil, podIP, mask, gw, gr)
+	if err != nil {
+		return err
+	}
+	if _, err = libovsdbops.TransactAndCheck(oc.nbClient, ops); err != nil {
+		return fmt.Errorf("error transacting static route delete: %v", err)
+	}
 	return nil
 }
 

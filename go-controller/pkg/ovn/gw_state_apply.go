@@ -27,6 +27,14 @@ type gwRouteProgrammer interface {
 	// gateway IP is in matchGWs. Pass an empty/nil set to delete all
 	// gateway routes for the namespace.
 	deleteRoutesForNamespace(ns string, matchGWs sets.Set[string]) error
+	// applyBFDReplaceAtomicallyForNamespace handles the BFD-flip case
+	// (same IP, different BFD flag) per pod, in one libovsdb
+	// transaction per pod. Required so no pod briefly loses its
+	// route during the BFD setting transition. Production
+	// implementations batch delete + create-with-new-BFD into one
+	// transaction; mocks may fall back to the equivalent semantics
+	// for testing.
+	applyBFDReplaceAtomicallyForNamespace(ns string, replaceIPs []gwIPBFD) error
 }
 
 // gwIPBFD pairs a gateway IP with its BFD flag. Used for the add/replace
@@ -189,27 +197,31 @@ func (s *nsAppliedGWState) Namespaces() []string {
 //   2. one add pass per BFD flag value, since the underlying primitive
 //      takes a single BFD flag for all IPs in its gatewayInfo.
 //
-// Order is delete-first to minimize the no-route window for replace
-// IPs. A single libovsdb transaction across delete + add is the ideal
-// (covered by Phase 1b.6 follow-up); today's primitives execute their
-// own transactions, so the BFD-flip case has a brief window where the
-// IP has no route. The window is bounded by one transaction round-trip
-// and only fires when an operator changes the BFD flag while the IP
-// itself is stable — a rare path.
+// Three passes:
+//   1. Pure removes — one transaction in deleteRoutesForNamespace.
+//   2. BFD replaces — applyBFDReplaceAtomicallyForNamespace batches
+//      delete+add per pod in one transaction each, so no pod loses
+//      its route to a replace-target IP during the transition.
+//   3. Pure adds, grouped by BFD flag — one transaction per group
+//      via addRoutesForNamespace.
+//
+// Pure-remove and pure-add IPs cannot have a "BFD changed" semantic,
+// so they don't need atomicity beyond their per-primitive transactions.
 func applyGWStateDelta(ns string, delta gwStateDelta, p gwRouteProgrammer) error {
 	if delta.empty() {
 		return nil
 	}
-	deleteIPs := sets.New[string](delta.remove...)
-	for _, e := range delta.replace {
-		deleteIPs.Insert(e.ip)
-	}
-	if deleteIPs.Len() > 0 {
-		if err := p.deleteRoutesForNamespace(ns, deleteIPs); err != nil {
+	if len(delta.remove) > 0 {
+		if err := p.deleteRoutesForNamespace(ns, sets.New(delta.remove...)); err != nil {
 			return err
 		}
 	}
-	addByBFD := groupAddsByBFD(delta)
+	if len(delta.replace) > 0 {
+		if err := p.applyBFDReplaceAtomicallyForNamespace(ns, delta.replace); err != nil {
+			return err
+		}
+	}
+	addByBFD := groupAddsByBFD(delta.add)
 	for _, bfd := range []bool{false, true} {
 		ips, ok := addByBFD[bfd]
 		if !ok || ips.Len() == 0 {
@@ -225,22 +237,16 @@ func applyGWStateDelta(ns string, delta gwStateDelta, p gwRouteProgrammer) error
 	return nil
 }
 
-// groupAddsByBFD merges delta.add and delta.replace into per-BFD-flag
-// IP sets. Replace IPs land in this same map because their re-add is
-// indistinguishable from an add for the purposes of the underlying
-// primitive — the preceding delete pass cleared the old route.
-func groupAddsByBFD(delta gwStateDelta) map[bool]sets.Set[string] {
-	if len(delta.add) == 0 && len(delta.replace) == 0 {
+// groupAddsByBFD groups pure-add IPs by their BFD flag. Replace IPs
+// are intentionally NOT included here — they're handled by the
+// per-pod atomic primitive (applyBFDReplaceAtomicallyForNamespace) so
+// no pod briefly loses its route during the BFD transition.
+func groupAddsByBFD(add []gwIPBFD) map[bool]sets.Set[string] {
+	if len(add) == 0 {
 		return nil
 	}
 	out := map[bool]sets.Set[string]{}
-	for _, e := range delta.add {
-		if out[e.bfd] == nil {
-			out[e.bfd] = sets.New[string]()
-		}
-		out[e.bfd].Insert(e.ip)
-	}
-	for _, e := range delta.replace {
+	for _, e := range add {
 		if out[e.bfd] == nil {
 			out[e.bfd] = sets.New[string]()
 		}

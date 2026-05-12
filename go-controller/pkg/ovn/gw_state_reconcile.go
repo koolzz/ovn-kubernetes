@@ -13,9 +13,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
+	"github.com/ovn-kubernetes/libovsdb/ovsdb"
+
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
+	apbroutecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/controller/apbroute"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 )
@@ -179,6 +182,103 @@ func (oc *DefaultNetworkController) addRoutesForNamespace(ns string, info gatewa
 // Adapter to the existing deleteGWRoutesForNamespace primitive.
 func (oc *DefaultNetworkController) deleteRoutesForNamespace(ns string, matchGWs sets.Set[string]) error {
 	return oc.deleteGWRoutesForNamespace(ns, matchGWs)
+}
+
+// applyBFDReplaceAtomicallyForNamespace replaces gateway-pod static
+// routes whose BFD flag is changing, per affected pod, in one libovsdb
+// transaction per pod. Per-pod atomicity ensures no pod briefly loses
+// its route to a replace-target gateway IP while the BFD setting
+// transitions — the previous "delete pass + add pass" sequence in
+// applyGWStateDelta exposed a bounded no-route window between the two
+// transactions.
+//
+// APB-managed gateway IPs are skipped; their routes are owned by the
+// apbroute controller. After each per-pod transaction we sweep
+// cleanUpBFDEntry for the affected (gw, gr, portPrefix) tuples so
+// orphaned BFD entries (created when an IP transitions BFD=true →
+// false and no other route still references the BFD) don't leak.
+// The cleanup is bounded to (gw, port) tuples we just touched; it
+// won't disturb BFD entries that are still referenced by other
+// routes.
+func (oc *DefaultNetworkController) applyBFDReplaceAtomicallyForNamespace(ns string, replaceIPs []gwIPBFD) error {
+	if len(replaceIPs) == 0 {
+		return nil
+	}
+	policyGWIPs, err := oc.apbExternalRouteController.GetDynamicGatewayIPsForTargetNamespace(ns)
+	if err != nil {
+		return err
+	}
+	policyStaticGWIPs, err := oc.apbExternalRouteController.GetStaticGatewayIPsForTargetNamespace(ns)
+	if err != nil {
+		return err
+	}
+	policyGWIPs = policyGWIPs.Union(policyStaticGWIPs)
+
+	targetBFD := map[string]bool{}
+	for _, e := range replaceIPs {
+		if !policyGWIPs.Has(e.ip) {
+			targetBFD[e.ip] = e.bfd
+		}
+	}
+	if len(targetBFD) == 0 {
+		return nil
+	}
+
+	// Per-(gw, gr, portPrefix) tuples touched by any per-pod
+	// transaction; swept by cleanUpBFDEntry after all transactions
+	// commit so orphan BFDs are removed.
+	type bfdSweep struct {
+		gw, gr, portPrefix string
+	}
+	var bfdSweeps []bfdSweep
+	seenSweep := map[bfdSweep]struct{}{}
+
+	if err := oc.externalGatewayRouteInfo.CleanupNamespace(ns, func(routeInfo *apbroutecontroller.RouteInfo) error {
+		var ops []ovsdb.Operation
+		for podIP, routes := range routeInfo.PodExternalRoutes {
+			for gw, gr := range routes {
+				newBFD, ok := targetBFD[gw]
+				if !ok {
+					continue
+				}
+				mask := util.GetIPFullMaskString(podIP)
+				node := util.GetWorkerFromGatewayRouter(gr)
+				portPrefix, err := oc.extSwitchPrefix(node)
+				if err != nil {
+					return fmt.Errorf("failed extSwitchPrefix for gr %s: %w", gr, err)
+				}
+				port := portPrefix + types.GWRouterToExtSwitchPrefix + gr
+				ops, err = oc.deleteLogicalRouterStaticRouteOps(ops, podIP, mask, gw, gr)
+				if err != nil {
+					return err
+				}
+				ops, err = oc.createBFDStaticRouteOps(ops, newBFD, gw, podIP, gr, port, mask)
+				if err != nil {
+					return err
+				}
+				sw := bfdSweep{gw: gw, gr: gr, portPrefix: portPrefix}
+				if _, dup := seenSweep[sw]; !dup {
+					seenSweep[sw] = struct{}{}
+					bfdSweeps = append(bfdSweeps, sw)
+				}
+			}
+		}
+		if len(ops) == 0 {
+			return nil
+		}
+		if _, err := libovsdbops.TransactAndCheck(oc.nbClient, ops); err != nil {
+			return fmt.Errorf("failed atomic BFD-replace transaction for pod %s: %w", routeInfo.PodName, err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, sw := range bfdSweeps {
+		if err := oc.cleanUpBFDEntry(sw.gw, sw.gr, sw.portPrefix); err != nil {
+			klog.Errorf("BFD orphan cleanup for gw=%s gr=%s: %v", sw.gw, sw.gr, err)
+		}
+	}
+	return nil
 }
 
 // bootstrapNSAppliedGWState seeds the per-namespace applied-state

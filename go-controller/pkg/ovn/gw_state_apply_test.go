@@ -194,14 +194,22 @@ type recordedDelete struct {
 	ips []string
 }
 
+// recordedReplace captures one applyBFDReplaceAtomicallyForNamespace call.
+type recordedReplace struct {
+	ns         string
+	replaceIPs []gwIPBFD
+}
+
 // fakeGWRouteProgrammer records calls and returns optional errors. Used
 // to verify applyGWStateDelta's call sequence and grouping. Add IPs in
 // the recorded calls are sorted to keep test assertions deterministic.
 type fakeGWRouteProgrammer struct {
 	adds        []recordedAdd
 	deletes     []recordedDelete
+	replaces    []recordedReplace
 	addErr      error
 	deleteErr   error
+	replaceErr  error
 	failOnAddIP string // if non-empty, return addErr only when this IP is in the call
 }
 
@@ -225,6 +233,18 @@ func (f *fakeGWRouteProgrammer) deleteRoutesForNamespace(ns string, matchGWs set
 		return f.deleteErr
 	}
 	f.deletes = append(f.deletes, recordedDelete{ns: ns, ips: ips})
+	return nil
+}
+
+func (f *fakeGWRouteProgrammer) applyBFDReplaceAtomicallyForNamespace(ns string, replaceIPs []gwIPBFD) error {
+	if f.replaceErr != nil {
+		return f.replaceErr
+	}
+	// Copy for deterministic recording.
+	dup := make([]gwIPBFD, len(replaceIPs))
+	copy(dup, replaceIPs)
+	sort.Slice(dup, func(i, j int) bool { return dup[i].ip < dup[j].ip })
+	f.replaces = append(f.replaces, recordedReplace{ns: ns, replaceIPs: dup})
 	return nil
 }
 
@@ -283,7 +303,7 @@ func TestApplyGWStateDelta_PureRemove(t *testing.T) {
 	}
 }
 
-func TestApplyGWStateDelta_BFDReplace_DeletesThenAdds(t *testing.T) {
+func TestApplyGWStateDelta_BFDReplace_RoutesThroughAtomicPrimitive(t *testing.T) {
 	delta := gwStateDelta{
 		replace: []gwIPBFD{{"10.0.0.1", true}},
 	}
@@ -291,15 +311,23 @@ func TestApplyGWStateDelta_BFDReplace_DeletesThenAdds(t *testing.T) {
 	if err := applyGWStateDelta("ns1", delta, f); err != nil {
 		t.Fatalf("apply should not error: %v", err)
 	}
-	if len(f.deletes) != 1 || !reflect.DeepEqual(f.deletes[0].ips, []string{"10.0.0.1"}) {
-		t.Fatalf("expected one delete for replace IP; got %v", f.deletes)
+	// BFD-replace IPs go through the per-pod atomic primitive, not
+	// through the delete+add pair. Per-pod atomicity is the
+	// correctness guarantee — no pod briefly loses its route to a
+	// replace-target IP.
+	if len(f.deletes) != 0 {
+		t.Fatalf("BFD-replace should not call delete; got %v", f.deletes)
 	}
-	if len(f.adds) != 1 || !reflect.DeepEqual(f.adds[0], recordedAdd{ns: "ns1", ips: []string{"10.0.0.1"}, bfd: true}) {
-		t.Fatalf("expected one add for replace IP with new BFD; got %v", f.adds)
+	if len(f.adds) != 0 {
+		t.Fatalf("BFD-replace should not call add; got %v", f.adds)
+	}
+	if len(f.replaces) != 1 ||
+		!reflect.DeepEqual(f.replaces[0], recordedReplace{ns: "ns1", replaceIPs: []gwIPBFD{{"10.0.0.1", true}}}) {
+		t.Fatalf("expected single atomic-replace call for the replace IP; got %v", f.replaces)
 	}
 }
 
-func TestApplyGWStateDelta_Mixed_DeleteThenAddOrder(t *testing.T) {
+func TestApplyGWStateDelta_Mixed_RemoveReplaceAdd(t *testing.T) {
 	delta := gwStateDelta{
 		add:     []gwIPBFD{{"10.0.0.4", false}},
 		remove:  []string{"10.0.0.3"},
@@ -309,19 +337,19 @@ func TestApplyGWStateDelta_Mixed_DeleteThenAddOrder(t *testing.T) {
 	if err := applyGWStateDelta("ns1", delta, f); err != nil {
 		t.Fatalf("apply should not error: %v", err)
 	}
-	// One delete pass covering remove + replace IPs (sorted).
-	if len(f.deletes) != 1 || !reflect.DeepEqual(f.deletes[0].ips, []string{"10.0.0.2", "10.0.0.3"}) {
-		t.Fatalf("expected single delete pass with merged IPs; got %v", f.deletes)
+	// Pure removes: one delete pass with just remove IPs (no replace).
+	if len(f.deletes) != 1 || !reflect.DeepEqual(f.deletes[0].ips, []string{"10.0.0.3"}) {
+		t.Fatalf("expected single delete pass with remove IPs only; got %v", f.deletes)
 	}
-	// Two add passes (one per BFD group, false first).
-	if len(f.adds) != 2 {
-		t.Fatalf("expected 2 add passes; got %d: %v", len(f.adds), f.adds)
+	// BFD replaces: one atomic-replace call.
+	if len(f.replaces) != 1 ||
+		!reflect.DeepEqual(f.replaces[0], recordedReplace{ns: "ns1", replaceIPs: []gwIPBFD{{"10.0.0.2", true}}}) {
+		t.Fatalf("expected single atomic-replace call; got %v", f.replaces)
 	}
-	if !reflect.DeepEqual(f.adds[0], recordedAdd{ns: "ns1", ips: []string{"10.0.0.4"}, bfd: false}) {
-		t.Fatalf("first add wrong: %+v", f.adds[0])
-	}
-	if !reflect.DeepEqual(f.adds[1], recordedAdd{ns: "ns1", ips: []string{"10.0.0.2"}, bfd: true}) {
-		t.Fatalf("second add wrong: %+v", f.adds[1])
+	// Pure adds: one add pass per BFD group (only false here — replace
+	// IP doesn't land in the add pass anymore).
+	if len(f.adds) != 1 || !reflect.DeepEqual(f.adds[0], recordedAdd{ns: "ns1", ips: []string{"10.0.0.4"}, bfd: false}) {
+		t.Fatalf("expected single add pass for pure-add IP; got %v", f.adds)
 	}
 }
 
