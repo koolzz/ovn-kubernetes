@@ -39,16 +39,12 @@ type gatewayInfo struct {
 	bfdEnabled bool
 }
 
-// addPodExternalGW handles detecting if a pod is serving as an external gateway for namespace(s) and adding routes
-// to all pods in that namespace
+// addPodExternalGW handles detecting if a pod is serving as an external gateway for namespace(s)
+// and reconciling per-namespace gateway state. gatewayPodIndex is the sole source of truth and is
+// updated at the top so the reconcile invocations below see the post-update view; reconcile
+// recomputes desired state from (annotation + index) for each target namespace and drives both
+// route programming and side effects.
 func (oc *DefaultNetworkController) addPodExternalGW(pod *corev1.Pod) error {
-	// gatewayPodIndex is the sole source of truth for gateway-pod
-	// state; keep it up-to-date at the top of the add path so the
-	// reconcile invocation downstream sees the post-update view.
-	// Update() returns the affected target ns set; we don't need it
-	// here because reconcileGWStateForNamespace recomputes from the
-	// index for the call-site namespace, but it remains useful for
-	// future fan-out paths.
 	if oc.gatewayPodIndex != nil {
 		_ = oc.gatewayPodIndex.Update(pod)
 	}
@@ -57,15 +53,11 @@ func (oc *DefaultNetworkController) addPodExternalGW(pod *corev1.Pod) error {
 	if podRoutingNamespaceAnno == "" {
 		return nil
 	}
-	enableBFD := false
-	if _, ok := pod.Annotations[util.BfdAnnotation]; ok {
-		enableBFD = true
-	}
 
 	klog.Infof("External gateway pod: %s, detected for namespace(s) %s", pod.Name, podRoutingNamespaceAnno)
 
 	// If an external gateway pod is in terminating or not ready state then don't add the
-	// routes for the external gateway pod
+	// routes for the external gateway pod.
 	if util.PodTerminating(pod) || !v1pod.IsPodReadyConditionTrue(pod.Status) {
 		klog.Warningf("External gateway pod cannot serve traffic; it's in terminating or not ready state: %s/%s", pod.Namespace, pod.Name)
 		return nil
@@ -77,30 +69,16 @@ func (oc *DefaultNetworkController) addPodExternalGW(pod *corev1.Pod) error {
 		oc.recordPodEvent("ErrorAddingLogicalPort", err, pod)
 		return nil
 	}
-
-	// if we found any gateways then we need to update current pods routing in the relevant namespace
-	if len(foundGws) == 0 {
+	if foundGws.Len() == 0 {
 		klog.Warningf("No valid gateway IPs found for requested external gateway pod: %s", pod.Name)
 		return nil
 	}
 
 	for _, namespace := range strings.Split(podRoutingNamespaceAnno, ",") {
-		err := oc.addPodExternalGWForNamespace(namespace, pod, gatewayInfo{gws: foundGws, bfdEnabled: enableBFD})
-		if err != nil {
-			return err
+		if err := oc.reconcileGWStateForNamespace(namespace); err != nil {
+			return fmt.Errorf("failed to reconcile GW state for pod %s/%s in namespace %s: %w",
+				pod.Namespace, pod.Name, namespace, err)
 		}
-	}
-	return nil
-}
-
-// addPodExternalGWForNamespace handles adding routes to all pods in that namespace for a pod GW.
-// gatewayPodIndex has already been updated at the top of addPodExternalGW, so reconcile sees the
-// post-add view. Side effects (annotation patch / conntrack flush) fire from inside reconcile.
-func (oc *DefaultNetworkController) addPodExternalGWForNamespace(namespace string, pod *corev1.Pod, egress gatewayInfo) error {
-	klog.Infof("Adding routes for external gateway pod: %s, next hops: %q, namespace: %s, bfd-enabled: %t",
-		pod.Name, strings.Join(egress.gws.UnsortedList(), ","), namespace, egress.bfdEnabled)
-	if err := oc.reconcileGWStateForNamespace(namespace); err != nil {
-		return fmt.Errorf("failed to reconcile GW state for pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	return nil
 }
@@ -302,44 +280,68 @@ func (oc *DefaultNetworkController) deletePodGWRoute(routeInfo *apbroutecontroll
 	return oc.cleanUpBFDEntry(gw, gr, portPrefix)
 }
 
-// deletePodExternalGW detects if a given pod is acting as an external GW and removes all routes in all namespaces
-// associated with that pod
+// deletePodExternalGW detects if a given pod is acting as an external GW and reconciles per-namespace
+// gateway state without it. gatewayPodIndex is the sole source of truth and is Delete'd at the top so
+// reconcile sees the post-delete view; reconcile emits the right delete delta when no other source
+// still desires this pod's gateway IPs.
+//
+// The reconcile set is the union of (a) the namespaces the index was
+// previously serving for this pod and (b) the pod's current
+// routing-namespaces annotation. Both sources are necessary because
+// informer ordering doesn't guarantee the annotation is still present
+// at delete time: if the annotation was cleared before the pod-delete
+// event arrives, only the index has the historical targets, and
+// skipping them would leak stale routes for namespaces that no longer
+// appear in the pod object.
 func (oc *DefaultNetworkController) deletePodExternalGW(pod *corev1.Pod) (err error) {
-	// Drop the pod from the gatewayPodIndex (sole source of truth) at
-	// the top of the delete path so the reconcile invocation
-	// downstream sees the post-delete view.
+	var priorTargets sets.Set[string]
 	if oc.gatewayPodIndex != nil {
-		_ = oc.gatewayPodIndex.Delete(makePodGWKey(pod))
+		priorTargets = oc.gatewayPodIndex.Delete(makePodGWKey(pod))
 	}
-
-	podRoutingNamespaceAnno := pod.Annotations[util.RoutingNamespaceAnnotation]
-	if podRoutingNamespaceAnno == "" {
+	targets := gatewayPodDeleteTargets(priorTargets, pod.Annotations[util.RoutingNamespaceAnnotation])
+	if targets.Len() == 0 {
 		return nil
 	}
-	klog.Infof("Deleting routes for external gateway pod: %s, for namespace(s) %s", pod.Name,
-		podRoutingNamespaceAnno)
-	for _, namespace := range strings.Split(podRoutingNamespaceAnno, ",") {
-		if err := oc.deletePodGWRoutesForNamespace(pod, namespace); err != nil {
-			// if we encounter error while deleting things in one namespace we return and don't try subsequent namespaces
-			return fmt.Errorf("failed to delete ecmp routes for pod %s in namespace %s", pod.Name, namespace)
+	klog.Infof("Deleting routes for external gateway pod: %s, for namespace(s) %v", pod.Name,
+		sets.List(targets))
+	for _, namespace := range sets.List(targets) {
+		if err := oc.reconcileGWStateForNamespace(namespace); err != nil {
+			// if we encounter error while reconciling one namespace we return and don't try subsequent namespaces
+			return fmt.Errorf("failed to reconcile GW state for pod %s deletion in namespace %s: %w",
+				pod.Name, namespace, err)
 		}
 	}
 	return nil
 }
 
-// deletePodGwRoutesForNamespace handles deleting all routes in a namespace for a specific pod GW.
-// gatewayPodIndex has already been Delete'd at the top of deletePodExternalGW, so reconcile sees
-// the post-delete view. Side effects (annotation patch / conntrack flush) fire from inside reconcile.
-func (oc *DefaultNetworkController) deletePodGWRoutesForNamespace(pod *corev1.Pod, namespace string) (err error) {
-	nsInfo, nsUnlock := oc.getNamespaceLocked(namespace, false)
-	if nsInfo == nil {
-		return nil
+// gatewayPodDeleteTargets is the pure-function core of
+// deletePodExternalGW's reconcile-set computation. Given the namespaces
+// the gatewayPodIndex was previously serving for the pod (returned by
+// the Delete call) and the pod's current routing-namespaces annotation,
+// returns the union — every namespace that needs a per-namespace
+// reconcile to converge on the pod's absence.
+//
+// Both sources matter: informer ordering doesn't guarantee the
+// annotation is still present at delete time. If the annotation was
+// cleared in a prior update before the delete event arrives, only the
+// index has the historical targets, and skipping them would leave
+// stale OVN routes pointing at the now-deleted pod.
+func gatewayPodDeleteTargets(priorTargets sets.Set[string], currentAnnotation string) sets.Set[string] {
+	out := sets.New[string]()
+	if priorTargets != nil {
+		out = out.Union(priorTargets)
 	}
-	nsUnlock()
-	if err := oc.reconcileGWStateForNamespace(namespace); err != nil {
-		return fmt.Errorf("failed to reconcile GW state for pod %s deletion: %w", pod.Name, err)
+	if currentAnnotation == "" {
+		return out
 	}
-	return nil
+	for _, ns := range strings.Split(currentAnnotation, ",") {
+		ns = strings.TrimSpace(ns)
+		if ns == "" {
+			continue
+		}
+		out.Insert(ns)
+	}
+	return out
 }
 
 // deleteGwRoutesForNamespace handles deleting routes to gateways for a pod on a specific GR.
