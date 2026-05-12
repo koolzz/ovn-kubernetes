@@ -240,11 +240,6 @@ func (c *NamespaceController) WaitForBootstrap(netName string, timeout time.Dura
 	}
 }
 
-// AnnotationCache returns the cache used for parsed namespace annotations.
-func (c *NamespaceController) AnnotationCache() *NamespaceAnnotationCache {
-	return c.annotationCache
-}
-
 // RegisterNetworkController registers or replaces a per-network namespace
 // handler. Registration triggers a bootstrap pass for the network: every
 // known namespace is sync'd via the handler's SyncNamespaces and then
