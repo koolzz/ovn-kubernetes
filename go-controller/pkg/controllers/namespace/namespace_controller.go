@@ -299,6 +299,14 @@ func (c *NamespaceController) DeregisterNetworkController(netName string) {
 // cached state.
 func (c *NamespaceController) reconcileNamespace(key string) error {
 	nsName, netName := parseScopedNamespaceQueueKey(key)
+	// Empty namespace names are not valid Kubernetes namespaces; an
+	// informer-driven Add with an empty-name namespace would loop the
+	// fan-out below indefinitely (scopedNamespaceQueueKey("", net)
+	// produces "|net", which parses with an empty nsName, fans out,
+	// re-encodes as "|net|net", etc.). Skip such keys at the source.
+	if nsName == "" {
+		return nil
+	}
 	// An empty netName fans out to every registered network.
 	if netName == "" {
 		for _, networkName := range c.handlers.GetKeys() {
@@ -411,8 +419,20 @@ func (c *NamespaceController) bootstrapNetwork(netName string, handler Namespace
 	if err := handler.SyncNamespaces(nss); err != nil {
 		return err
 	}
-	c.setBootstrapNamespaces(netName, nss)
+	// Empty-name namespaces (test-only fixtures; Kubernetes rejects
+	// them in production) can't roundtrip through the scoped queue key
+	// encoding and would never be reconciled by the worker, leaving
+	// the bootstrap drain hanging. Filter them out of both the
+	// outstanding-reconciliation set and the enqueue pass.
+	valid := nss[:0]
 	for _, ns := range nss {
+		if ns.Name == "" {
+			continue
+		}
+		valid = append(valid, ns)
+	}
+	c.setBootstrapNamespaces(netName, valid)
+	for _, ns := range valid {
 		c.nsController.Reconcile(scopedNamespaceQueueKey(ns.Name, netName))
 	}
 	return nil
@@ -591,11 +611,16 @@ func scopedNamespaceQueueKey(nsName, netName string) string {
 func parseScopedNamespaceQueueKey(key string) (nsName, netName string) {
 	parts := strings.SplitN(key, scopedNamespaceQueueKeySeparator, 2)
 	if len(parts) != 2 {
+		// Bare key, no separator — this is an informer-driven event for
+		// the namespace resource itself (network unscoped).
 		return key, ""
 	}
-	if parts[0] == "" || parts[1] == "" {
-		return key, ""
-	}
+	// Presence of the separator means this is a scoped key. Roundtrip
+	// it as-is even if one part is empty; otherwise
+	// scopedNamespaceQueueKey("", "net") → "|net" would parse back to
+	// nsName="|net" + netName="" and fan-out would loop, re-encoding
+	// as "|net|net", "|net|net|net", etc. The reconcile entry point
+	// short-circuits on empty nsName.
 	return parts[0], parts[1]
 }
 

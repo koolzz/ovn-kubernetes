@@ -698,7 +698,10 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(addrSets).To(BeEmpty(), "address set should be deleted from NB DB after cleanup")
 
-			// Recreate: new controller for the same network
+			// Recreate: new controller for the same network. The existing
+			// l2Controller's namespace handler registration was released
+			// by Cleanup() above (DeregisterNamespaceHandler), so the
+			// new controller can register against the same network name.
 			l2ControllerNew, err := NewLayer2UserDefinedNetworkController(
 				&l2Controller.CommonNetworkControllerInfo,
 				mutableNetInfo,
@@ -708,7 +711,7 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 				nil,
 				fakeOvn.addressSetManager,
 				nil,
-				nil,
+				fakeOvn.controller.nsReconciler,
 			)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(l2ControllerNew.init()).To(Succeed())

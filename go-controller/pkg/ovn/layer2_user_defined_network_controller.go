@@ -409,6 +409,11 @@ func (oc *Layer2UserDefinedNetworkController) run() error {
 // could be called from a dummy Controller (only has CommonNetworkControllerInfo set)
 func (oc *Layer2UserDefinedNetworkController) Cleanup() error {
 	networkName := oc.GetNetworkName()
+	// Release any namespace-handler registration with the shared
+	// NamespaceController. No-op when the controller was never
+	// registered (dummy cleanup-only controllers, or cleanup chains
+	// that ran without a prior run()).
+	oc.DeregisterNamespaceHandler()
 
 	// For primary Layer2 UDN only: when this is a cleanup-only controller (dummy for stale UDN
 	// cleanup; GetNetworkID() is InvalidID because netInfo was never reconciled from a NAD),
