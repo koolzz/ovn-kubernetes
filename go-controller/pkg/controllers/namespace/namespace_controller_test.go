@@ -265,6 +265,35 @@ func TestRegisterDeregisterNetworkController(t *testing.T) {
 	}
 }
 
+func TestBootstrapNetwork_FiltersEmptyNameNamespaces(t *testing.T) {
+	// Empty-name namespaces (test fixtures only — Kubernetes rejects
+	// them in production) must NOT be enqueued during bootstrap, and
+	// must NOT contribute to nsReconciliation. scopedNamespaceQueueKey
+	// produces "|net" for empty nsName which the parser then loops on
+	// during fan-out; the bootstrap-side filter is the upstream
+	// defense for the reconcileNamespace short-circuit.
+	c := newTestController(t)
+	c.nsLister = newNamespaceLister(t,
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "real-ns"}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ""}},
+	)
+	h := &fakeNamespaceHandler{netName: "net-a"}
+	if err := c.RegisterNetworkController(h); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// SyncNamespaces is called with the unfiltered list (it's the
+	// handler's call); the bootstrap drain set is what matters.
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	pending := c.nsReconciliation["net-a"]
+	if _, ok := pending[""]; ok {
+		t.Fatalf("empty-name namespace must not be in nsReconciliation; got %v", pending)
+	}
+	if _, ok := pending["real-ns"]; !ok {
+		t.Fatalf("real-ns must be in nsReconciliation; got %v", pending)
+	}
+}
+
 func TestRegisterNetworkControllerBootstrapFailure(t *testing.T) {
 	c := newTestController(t)
 	h := &fakeNamespaceHandler{netName: "net-a", syncErr: errors.New("sync failed")}
