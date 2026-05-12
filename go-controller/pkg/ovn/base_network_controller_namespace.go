@@ -342,44 +342,6 @@ func (bnc *BaseNetworkController) configureNamespaceCommon(nsInfo *namespaceInfo
 	return nil
 }
 
-// GetNamespaceACLLogging retrieves ACLLoggingLevels for the Namespace by
-// value. Returns a zero-value struct if the namespace is unknown.
-//
-// This used to return a pointer to nsInfo.aclLogging after the lock was
-// released, which is a race the caller could not avoid. The current
-// implementation deep-copies the value while the lock is held.
-func (bnc *BaseNetworkController) GetNamespaceACLLogging(ns string) libovsdbutil.ACLLoggingLevels {
-	nsInfo, nsUnlock := bnc.getNamespaceLocked(ns, true)
-	if nsInfo == nil {
-		return libovsdbutil.ACLLoggingLevels{}
-	}
-	defer nsUnlock()
-	return nsInfo.aclLogging
-}
-
-// GetNamespaceMulticastEnabled returns whether multicast is currently
-// enabled for the namespace. Returns false if the namespace is unknown.
-func (bnc *BaseNetworkController) GetNamespaceMulticastEnabled(ns string) bool {
-	nsInfo, nsUnlock := bnc.getNamespaceLocked(ns, true)
-	if nsInfo == nil {
-		return false
-	}
-	defer nsUnlock()
-	return nsInfo.multicastEnabled
-}
-
-// GetNamespacePortGroup returns the namespace's port-group name. Returns
-// the empty string if the namespace is unknown or no port group has been
-// created.
-func (bnc *BaseNetworkController) GetNamespacePortGroup(ns string) string {
-	nsInfo, nsUnlock := bnc.getNamespaceLocked(ns, true)
-	if nsInfo == nil {
-		return ""
-	}
-	defer nsUnlock()
-	return nsInfo.portGroupName
-}
-
 func (bnc *BaseNetworkController) updateNamespaceAclLogging(ns, aclAnnotation string, nsInfo *namespaceInfo) error {
 	// When input cannot be parsed correctly, aclLoggingUpdateNsInfo disables logging and returns an error. Hence,
 	// log a warning to make users aware of issues with the annotation. See aclLoggingUpdateNsInfo for more details.
