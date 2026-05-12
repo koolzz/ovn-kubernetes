@@ -384,6 +384,73 @@ func TestApplyGWStateDelta_AddFailurePropagates(t *testing.T) {
 	}
 }
 
+func TestApplyGWStateDelta_ReplaceFailurePropagates(t *testing.T) {
+	delta := gwStateDelta{
+		replace: []gwIPBFD{{"10.0.0.1", true}},
+	}
+	wantErr := errors.New("replace kaboom")
+	f := &fakeGWRouteProgrammer{replaceErr: wantErr}
+	err := applyGWStateDelta("ns1", delta, f)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected replace error to surface; got %v", err)
+	}
+	if len(f.adds) != 0 {
+		t.Fatalf("replace failure should skip add pass; got %v", f.adds)
+	}
+}
+
+func TestApplyGWStateDelta_RemoveBeforeReplaceBeforeAdd(t *testing.T) {
+	// Ensure the call order is remove → replace → add. The order is
+	// load-bearing: replace IPs are independently atomic per pod, so
+	// they don't need a global ordering against remove or add, but
+	// keeping the sequence deterministic helps operator-visible logs
+	// and avoids surprises if a future change introduces ordering
+	// dependencies.
+	delta := gwStateDelta{
+		add:     []gwIPBFD{{"10.0.0.5", true}},
+		remove:  []string{"10.0.0.3"},
+		replace: []gwIPBFD{{"10.0.0.7", false}},
+	}
+	var calls []orderRecorderCall
+	wrap := &orderRecorderProgrammer{inner: &fakeGWRouteProgrammer{}, calls: &calls}
+	if err := applyGWStateDelta("ns1", delta, wrap); err != nil {
+		t.Fatalf("apply should not error: %v", err)
+	}
+	want := []orderRecorderCall{
+		{op: "delete", ns: "ns1"},
+		{op: "replace", ns: "ns1"},
+		{op: "add", ns: "ns1"},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("call order: got %v want %v", calls, want)
+	}
+}
+
+type orderRecorderCall struct {
+	op string
+	ns string
+}
+
+type orderRecorderProgrammer struct {
+	inner *fakeGWRouteProgrammer
+	calls *[]orderRecorderCall
+}
+
+func (o *orderRecorderProgrammer) addRoutesForNamespace(ns string, info gatewayInfo) error {
+	*o.calls = append(*o.calls, orderRecorderCall{op: "add", ns: ns})
+	return o.inner.addRoutesForNamespace(ns, info)
+}
+
+func (o *orderRecorderProgrammer) deleteRoutesForNamespace(ns string, matchGWs sets.Set[string]) error {
+	*o.calls = append(*o.calls, orderRecorderCall{op: "delete", ns: ns})
+	return o.inner.deleteRoutesForNamespace(ns, matchGWs)
+}
+
+func (o *orderRecorderProgrammer) applyBFDReplaceAtomicallyForNamespace(ns string, replaceIPs []gwIPBFD) error {
+	*o.calls = append(*o.calls, orderRecorderCall{op: "replace", ns: ns})
+	return o.inner.applyBFDReplaceAtomicallyForNamespace(ns, replaceIPs)
+}
+
 func TestApplyGWStateDelta_PartialAddFailure_SecondPassNotRun(t *testing.T) {
 	// Verify that if the first BFD group's add fails, the second
 	// group is not attempted — the namespace is left for the next
