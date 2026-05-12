@@ -5,7 +5,9 @@ package namespace
 
 import (
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -79,6 +81,7 @@ func newTestController(t *testing.T) *NamespaceController {
 		nsLister:              newNamespaceLister(t),
 		handlers:              syncmap.NewSyncMap[NamespaceHandler](),
 		nsReconciliation:      map[string]map[string]bool{},
+		bootstrapPending:      map[string]map[string]struct{}{},
 		nsActive:              map[string]map[string]struct{}{},
 		nsNetworks:            map[string]map[string]struct{}{},
 		nsCache:               map[string]map[string]*corev1.Namespace{},
@@ -93,6 +96,11 @@ func TestScopedNamespaceQueueKeyRoundtrip(t *testing.T) {
 		{"alpha", "default"},
 		{"beta", "tenant-a"},
 		{"with-dash", "udn-1"},
+		// Empty namespace name must roundtrip too — kubevirt tests
+		// historically create namespace fixtures with zero-valued names,
+		// and a non-roundtripping parse would loop the fan-out
+		// indefinitely ("|net" → bare → enqueue "|net|net" → ...).
+		{"", "default"},
 	}
 	for _, tc := range cases {
 		key := scopedNamespaceQueueKey(tc.ns, tc.net)
@@ -108,6 +116,131 @@ func TestParseScopedNamespaceQueueKey_FanOut(t *testing.T) {
 	ns, net := parseScopedNamespaceQueueKey("alpha")
 	if ns != "alpha" || net != "" {
 		t.Fatalf("unexpected fan-out parse: ns=%q net=%q", ns, net)
+	}
+}
+
+func TestWaitForBootstrap(t *testing.T) {
+	c := newTestController(t)
+	// Empty bootstrapPending drains immediately.
+	if err := c.WaitForBootstrap("default", 100*time.Millisecond); err != nil {
+		t.Fatalf("empty bootstrapPending should drain immediately; got %v", err)
+	}
+	// A pending bootstrap entry blocks until drained; the timeout
+	// expires here because nothing clears it.
+	c.stateMu.Lock()
+	c.bootstrapPending["default"] = map[string]struct{}{"alpha": {}}
+	c.stateMu.Unlock()
+	if err := c.WaitForBootstrap("default", 50*time.Millisecond); err == nil {
+		t.Fatal("WaitForBootstrap should time out while bootstrapPending has entries")
+	}
+	// markBootstrapAttempted lets it drain (the public path; equivalent
+	// to what reconcileNamespace's defer does).
+	c.markBootstrapAttempted("default", "alpha")
+	if err := c.WaitForBootstrap("default", 100*time.Millisecond); err != nil {
+		t.Fatalf("after markBootstrapAttempted, bootstrap should drain; got %v", err)
+	}
+}
+
+func TestWaitForBootstrap_DrainsOnHandlerError(t *testing.T) {
+	// Regression: previously the bootstrap entry was cleared only on
+	// SUCCESSFUL handler return, so one transient reconcile error
+	// (e.g., a malformed external-gateway annotation crashing parse, a
+	// transient NBDB hiccup) would brick controller startup after the
+	// 30s timeout. WaitForBootstrap must now return as soon as every
+	// bootstrap namespace has been ATTEMPTED, regardless of outcome —
+	// failed namespaces stay in the workqueue's retry path with normal
+	// backoff but no longer block dependent watchers.
+	c := newTestController(t)
+	wantErr := errors.New("transient handler failure")
+	h := &fakeNamespaceHandler{netName: "default", reconcileErr: wantErr}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "alpha"}}
+	c.nsLister = newNamespaceLister(t, ns)
+	c.handlers.Store("default", h)
+	c.setBootstrapNamespaces("default", []*corev1.Namespace{ns})
+
+	// Sanity: the namespace is pending before any reconcile attempt.
+	c.stateMu.RLock()
+	if _, pending := c.bootstrapPending["default"]["alpha"]; !pending {
+		c.stateMu.RUnlock()
+		t.Fatal("test premise: bootstrapPending must contain alpha before the reconcile")
+	}
+	c.stateMu.RUnlock()
+
+	// Run the reconcile. The handler returns an error, so the
+	// reconcileNamespace return propagates the error to the workqueue
+	// for retry. But the bootstrap entry MUST be cleared by the defer.
+	err := c.reconcileNamespace(scopedNamespaceQueueKey("alpha", "default"))
+	if err == nil {
+		t.Fatal("expected handler error to propagate to the workqueue")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected wrapped %v, got %v", wantErr, err)
+	}
+
+	// WaitForBootstrap must return without timing out — the namespace
+	// has been ATTEMPTED, that's all the drain cares about.
+	if err := c.WaitForBootstrap("default", 100*time.Millisecond); err != nil {
+		t.Fatalf("bootstrap should drain after one attempt even on handler error; got %v", err)
+	}
+
+	// nsReconciliation entry persists (still needs the Mark*
+	// fresh-add semantic on the next retry) — only bootstrapPending
+	// gets cleared by the attempt.
+	c.stateMu.RLock()
+	if _, stillPending := c.nsReconciliation["default"]["alpha"]; !stillPending {
+		t.Error("nsReconciliation entry must persist on handler error so the retry treats it as fresh-add")
+	}
+	c.stateMu.RUnlock()
+}
+
+func TestWaitForBootstrap_TimeoutErrorIncludesSample(t *testing.T) {
+	// The timeout error message must include a sample of pending
+	// namespaces so operators debugging a hung startup can see which
+	// namespaces never had a worker pick them up.
+	c := newTestController(t)
+	c.stateMu.Lock()
+	c.bootstrapPending["default"] = map[string]struct{}{
+		"alpha": {}, "beta": {}, "gamma": {},
+	}
+	c.stateMu.Unlock()
+	err := c.WaitForBootstrap("default", 30*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "3 namespaces pending") {
+		t.Errorf("error must include count of pending namespaces: %q", msg)
+	}
+	// At least one of the pending names should appear in the message
+	// (we don't assert exact ordering since map iteration is unordered).
+	hasSample := false
+	for _, name := range []string{"alpha", "beta", "gamma"} {
+		if strings.Contains(msg, name) {
+			hasSample = true
+			break
+		}
+	}
+	if !hasSample {
+		t.Errorf("error must include at least one pending namespace name: %q", msg)
+	}
+}
+
+func TestReconcileNamespace_EmptyNameIsNoop(t *testing.T) {
+	// scopedNamespaceQueueKey("", "default") encodes as "|default";
+	// parseScopedNamespaceQueueKey returns ("", "default"); reconcile
+	// short-circuits on the empty nsName so fan-out doesn't loop and
+	// no handler is invoked. Asserting nil return (no error) is the
+	// observable contract.
+	c := newTestController(t)
+	h := &fakeNamespaceHandler{netName: "default"}
+	if err := c.RegisterNetworkController(h); err != nil {
+		t.Fatalf("RegisterNetworkController failed: %v", err)
+	}
+	if err := c.reconcileNamespace(scopedNamespaceQueueKey("", "default")); err != nil {
+		t.Fatalf("reconcileNamespace on empty-name key should be a no-op; got %v", err)
+	}
+	if h.reconcileCalls != 0 {
+		t.Fatalf("handler.ReconcileNamespace should not have been called for empty-name key; got %d calls", h.reconcileCalls)
 	}
 }
 
