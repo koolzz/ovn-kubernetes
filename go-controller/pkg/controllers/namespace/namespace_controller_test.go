@@ -25,6 +25,7 @@ type fakeNamespaceHandler struct {
 	netName        string
 	syncErr        error
 	reconcileErr   error
+	claimsFn       func(string) (bool, error)
 	syncCalls      int
 	reconcileCalls int
 	deleteCalls    int
@@ -32,6 +33,13 @@ type fakeNamespaceHandler struct {
 }
 
 func (f *fakeNamespaceHandler) GetNetworkName() string { return f.netName }
+
+func (f *fakeNamespaceHandler) ClaimsNamespace(nsName string) (bool, error) {
+	if f.claimsFn != nil {
+		return f.claimsFn(nsName)
+	}
+	return nsName != "", nil
+}
 
 func (f *fakeNamespaceHandler) ReconcileNamespace(oldNS, newNS *corev1.Namespace, _, _ *NamespaceAnnotationState) error {
 	if oldNS != nil {
@@ -366,6 +374,33 @@ func TestSetAndDeleteNamespaceActive(t *testing.T) {
 	c.deleteNamespaceActive("net-b", "ns1")
 	if c.namespaceHasAnyNetwork("ns1") {
 		t.Fatal("ns1 should not be active on any network after both removed")
+	}
+}
+
+func TestNamespaceHasNetwork(t *testing.T) {
+	c := newTestController(t)
+
+	if c.namespaceHasNetwork("net-a", "ns1") {
+		t.Fatal("namespaceHasNetwork must return false before any active set")
+	}
+
+	c.setNamespaceActive("net-a", "ns1")
+	if !c.namespaceHasNetwork("net-a", "ns1") {
+		t.Fatal("namespaceHasNetwork must return true after setNamespaceActive")
+	}
+	// Scoping: setting (net-a, ns1) active must not leak to (net-b, ns1)
+	// or (net-a, ns2). The transition gate relies on the per-pair
+	// answer being correct.
+	if c.namespaceHasNetwork("net-b", "ns1") {
+		t.Fatal("namespaceHasNetwork must not leak across networks")
+	}
+	if c.namespaceHasNetwork("net-a", "ns2") {
+		t.Fatal("namespaceHasNetwork must not leak across namespaces")
+	}
+
+	c.deleteNamespaceActive("net-a", "ns1")
+	if c.namespaceHasNetwork("net-a", "ns1") {
+		t.Fatal("namespaceHasNetwork must return false after deleteNamespaceActive")
 	}
 }
 

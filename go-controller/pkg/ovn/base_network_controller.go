@@ -422,6 +422,39 @@ func (oc *BaseUserDefinedNetworkController) shouldFilterNamespace(namespace stri
 	return networkName != oc.GetNetworkName()
 }
 
+// ClaimsNamespace implements NamespaceHandler for User Defined Networks.
+// It is the !shouldFilterNamespace twin, with one critical difference:
+// transient lookup errors (e.g. GetPrimaryNADForNamespace returning an
+// InvalidPrimaryNetworkError because the NAD cache hasn't caught up) are
+// surfaced to the shared namespace controller so the reconcile can be
+// requeued instead of silently treating the namespace as belonging.
+// shouldFilterNamespace remains in place for the per-network retry pod
+// filter (FilterOutResource), where the legacy swallow-on-error
+// behavior is preserved deliberately.
+func (oc *BaseUserDefinedNetworkController) ClaimsNamespace(nsName string) (bool, error) {
+	if !oc.IsPrimaryNetwork() || oc.networkManager == nil {
+		return util.CanServeNamespace(oc.GetNetInfo(), nsName), nil
+	}
+	nadKey, err := oc.networkManager.GetPrimaryNADForNamespace(nsName)
+	if err != nil {
+		return false, err
+	}
+	if nadKey == "" {
+		// Namespace not found in the lister — treat as not claimed.
+		// The shared controller's deletion special-case handles the
+		// "we had it cached" path separately, so this is safe.
+		return false, nil
+	}
+	if nadKey == types.DefaultNetworkName {
+		return false, nil
+	}
+	networkName := oc.networkManager.GetNetworkNameForNADKey(nadKey)
+	if networkName == "" {
+		return util.CanServeNamespace(oc.GetNetInfo(), nsName), nil
+	}
+	return networkName == oc.GetNetworkName(), nil
+}
+
 func getNetworkControllerName(netName string) string {
 	return netName + "-network-controller"
 }

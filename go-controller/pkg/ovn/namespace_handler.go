@@ -45,6 +45,14 @@ func (oc *DefaultNetworkController) ReconcileNamespace(oldNS, newNS *corev1.Name
 	}
 }
 
+// ClaimsNamespace implements NamespaceHandler. The default network
+// claims every non-empty namespace; empty-name namespaces (test-only
+// fixtures, rejected by real Kubernetes) are excluded so the shared
+// controller never marks them active.
+func (oc *DefaultNetworkController) ClaimsNamespace(nsName string) (bool, error) {
+	return nsName != "", nil
+}
+
 // SyncNamespaces implements NamespaceHandler. The legacy
 // syncNamespaces signature takes []interface{} for retry-framework
 // reasons; convert to that shape on the way in.

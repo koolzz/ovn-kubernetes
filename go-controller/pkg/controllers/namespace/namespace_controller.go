@@ -52,6 +52,21 @@ import (
 type NamespaceHandler interface {
 	// GetNetworkName returns the network this handler reconciles.
 	GetNetworkName() string
+	// ClaimsNamespace reports whether this handler would program any
+	// OVN state for nsName. The shared controller calls it before
+	// dispatch to detect membership transitions (e.g. a NAD change
+	// moving a namespace between UDNs) and to decide which leg of the
+	// reconcile to run.
+	//
+	// Returns:
+	//   - (true,  nil)  — namespace belongs to this handler's network.
+	//   - (false, nil)  — namespace does not belong (filtered).
+	//   - (_,     err)  — predicate could not be evaluated (e.g.
+	//     transient cache miss). The controller must NOT mutate active
+	//     or cache state on this path; the reconcile is requeued.
+	//
+	// Implementations must be cheap and side-effect-free.
+	ClaimsNamespace(nsName string) (bool, error)
 	// ReconcileNamespace reconciles the network-specific state for a
 	// namespace. oldNS and oldState may be nil when the namespace is
 	// first seen for the network or becomes active again. For delete
@@ -554,6 +569,21 @@ func (c *NamespaceController) namespaceHasAnyNetwork(nsName string) bool {
 	c.stateMu.RLock()
 	defer c.stateMu.RUnlock()
 	return len(c.nsNetworks[nsName]) > 0
+}
+
+// namespaceHasNetwork reports whether the last successfully-applied state
+// for nsName under netName was active. Mirrors NodeController.nodeHasNetwork.
+// Used by the per-reconcile transition gate to detect membership changes
+// (a namespace moving between handlers via a NAD change).
+func (c *NamespaceController) namespaceHasNetwork(netName, nsName string) bool {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	nss := c.nsActive[netName]
+	if len(nss) == 0 {
+		return false
+	}
+	_, ok := nss[nsName]
+	return ok
 }
 
 func (c *NamespaceController) setNamespaceActive(netName, nsName string) {
