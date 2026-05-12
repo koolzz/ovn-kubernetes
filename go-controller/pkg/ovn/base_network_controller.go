@@ -236,13 +236,9 @@ func (oc *BaseNetworkController) reconcile(netInfo util.NetInfo, setNodeFailed f
 	reconcileRoutes := oc.routeImportManager != nil && oc.routeImportManager.NeedsReconciliation(netInfo)
 	nadKeys := oc.networkManager.GetNADKeysForNetwork(netInfo.GetNetworkName())
 	reconcilePendingPods := !oc.IsDefault() && oc.updateNADKeysChanged(nadKeys)
-	reconcileNamespaces := sets.NewString()
+	reconcileNamespaces := []string{}
 	if oc.IsPrimaryNetwork() {
-		// since CanServeNamespace filters out namespace events for namespaces unknown
-		// to be served by this primary network, we need to reconcile namespaces once
-		// the network is reconfigured to serve a namespace.
-		reconcileNamespaces = sets.NewString(netInfo.GetNADNamespaces()...).Difference(
-			sets.NewString(oc.GetNADNamespaces()...))
+		reconcileNamespaces = nadNamespacesNeedingReconcile(oc.GetNADNamespaces(), netInfo.GetNADNamespaces())
 	}
 
 	// set the new NetInfo, point of no return
@@ -250,7 +246,29 @@ func (oc *BaseNetworkController) reconcile(netInfo util.NetInfo, setNodeFailed f
 	if err != nil {
 		return fmt.Errorf("failed to reconcile network information for network %s: %v", oc.GetNetworkName(), err)
 	}
-	return oc.doReconcile(reconcileRoutes, reconcilePendingPods, reconcileNodes, setNodeFailed, reconcileNamespaces.List())
+	return oc.doReconcile(reconcileRoutes, reconcilePendingPods, reconcileNodes, setNodeFailed, reconcileNamespaces)
+}
+
+// nadNamespacesNeedingReconcile returns the set of namespaces whose
+// NAD-set membership for this network is changing — added on this
+// transition or removed on this transition. Namespaces present in both
+// sets are unchanged for this network and need no reconcile.
+//
+// Both transitions must be enqueued: the per-namespace event path does
+// NOT fire for a namespace that has merely lost network membership
+// (the namespace object itself didn't change), so without enqueuing
+// removed namespaces here the shared-controller transition gate
+// (had && !has) cannot fire and OVN state for the previous owner
+// leaks. Mirrors the services-controller behavior of re-syncing both
+// sides of a NAD-set change.
+//
+// SymmetricDifference is the right primitive — not Union — because
+// namespaces in the intersection have stable membership for this
+// network and re-reconciling them would be wasted work.
+func nadNamespacesNeedingReconcile(oldNADNamespaces, newNADNamespaces []string) []string {
+	return sets.NewString(newNADNamespaces...).
+		SymmetricDifference(sets.NewString(oldNADNamespaces...)).
+		List()
 }
 
 func (oc *BaseNetworkController) updateNADKeysChanged(nadKeys []string) bool {

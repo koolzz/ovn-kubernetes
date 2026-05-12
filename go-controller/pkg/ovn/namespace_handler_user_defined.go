@@ -21,25 +21,28 @@ var (
 )
 
 // ReconcileNamespace implements NamespaceHandler for User Defined
-// Networks. The NamespaceAnnotationState is intentionally unused for
-// now — legacy add/update/delete still read raw annotations off the
-// namespace object. shouldFilterNamespace mirrors the FilterOutResource
-// gate that the per-UDN retry framework applies today, so namespaces
-// not served by this network are skipped.
+// Networks. Pure applier: the shared NamespaceController's transition
+// gate (ClaimsNamespace + namespaceHasNetwork) decides membership
+// before dispatch, so this handler trusts the (oldNS, newNS) it
+// receives:
+//
+//   - (oldNS, newNS) update with newNS != nil → handler claims now.
+//   - (nil,   newNS) fresh add → handler claims now.
+//   - (oldNS, nil)   delete → handler had applied state. May or may
+//     not still claim; programming the delete unconditionally is the
+//     load-bearing invariant. If we re-checked current membership
+//     here, an active→inactive NAD transition would short-circuit
+//     and leave OVN state for the previous owner orphaned (the
+//     namespace-controller would clear active+cache and never call
+//     the handler again).
+//
+// NamespaceAnnotationState is intentionally unused — legacy
+// add/update/delete still read raw annotations off the namespace
+// object.
 func (oc *BaseUserDefinedNetworkController) ReconcileNamespace(oldNS, newNS *corev1.Namespace, _, _ *nscontroller.NamespaceAnnotationState) error {
-	var nsName string
 	switch {
 	case newNS == nil && oldNS == nil:
 		return nil
-	case newNS == nil:
-		nsName = oldNS.Name
-	default:
-		nsName = newNS.Name
-	}
-	if oc.shouldFilterNamespace(nsName) {
-		return nil
-	}
-	switch {
 	case newNS == nil:
 		return oc.deleteNamespaceForUserDefinedNetwork(oldNS)
 	case oldNS == nil:

@@ -25,6 +25,7 @@ type fakeNamespaceHandler struct {
 	netName        string
 	syncErr        error
 	reconcileErr   error
+	deleteErr      error
 	claimsFn       func(string) (bool, error)
 	syncCalls      int
 	reconcileCalls int
@@ -49,7 +50,7 @@ func (f *fakeNamespaceHandler) ReconcileNamespace(oldNS, newNS *corev1.Namespace
 	}
 	if newNS == nil {
 		f.deleteCalls++
-		return nil
+		return f.deleteErr
 	}
 	f.reconcileCalls++
 	return f.reconcileErr
@@ -402,6 +403,194 @@ func TestNamespaceHasNetwork(t *testing.T) {
 	if c.namespaceHasNetwork("net-a", "ns1") {
 		t.Fatal("namespaceHasNetwork must return false after deleteNamespaceActive")
 	}
+}
+
+// transitionGateFixture wires a NamespaceController against a single
+// registered fake handler and a lister seeded with the given namespaces,
+// then returns helpers the per-case tests use to drive reconcileNamespace
+// directly. Bootstrap is intentionally bypassed (handler is stored
+// without RegisterNetworkController) so individual tests can control the
+// pre-conditions of the gate (had / claims-fn / lister content) without
+// the full registration pass interfering.
+func transitionGateFixture(t *testing.T, netName string, claims func(string) (bool, error), nss ...*corev1.Namespace) (*NamespaceController, *fakeNamespaceHandler) {
+	t.Helper()
+	c := newTestController(t)
+	c.nsLister = newNamespaceLister(t, nss...)
+	h := &fakeNamespaceHandler{netName: netName, claimsFn: claims}
+	c.handlers.Store(netName, h)
+	return c, h
+}
+
+func TestReconcileNamespace_TransitionGate(t *testing.T) {
+	const netName = "net-a"
+	const nsName = "ns1"
+	makeNS := func() *corev1.Namespace {
+		return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
+	}
+
+	t.Run("!had && !has → no dispatch, no caching", func(t *testing.T) {
+		c, h := transitionGateFixture(t, netName, func(string) (bool, error) { return false, nil }, makeNS())
+		if err := c.reconcileNamespace(scopedNamespaceQueueKey(nsName, netName)); err != nil {
+			t.Fatalf("reconcileNamespace: %v", err)
+		}
+		if h.reconcileCalls != 0 || h.deleteCalls != 0 {
+			t.Fatalf("expected zero handler calls; got reconcile=%d delete=%d", h.reconcileCalls, h.deleteCalls)
+		}
+		if c.namespaceHasNetwork(netName, nsName) {
+			t.Fatal("namespace must not be marked active for an unclaimed namespace")
+		}
+		if c.getCachedNamespace(netName, nsName) != nil {
+			t.Fatal("namespace must not be cached for an unclaimed namespace")
+		}
+	})
+
+	t.Run("!had && has → fresh add, oldNS nil", func(t *testing.T) {
+		c, h := transitionGateFixture(t, netName, func(string) (bool, error) { return true, nil }, makeNS())
+		if err := c.reconcileNamespace(scopedNamespaceQueueKey(nsName, netName)); err != nil {
+			t.Fatalf("reconcileNamespace: %v", err)
+		}
+		if h.reconcileCalls != 1 || h.deleteCalls != 0 {
+			t.Fatalf("expected exactly one add; got reconcile=%d delete=%d", h.reconcileCalls, h.deleteCalls)
+		}
+		if h.lastOldNS != nil {
+			t.Fatalf("force-add path must dispatch with oldNS=nil; got %#v", h.lastOldNS)
+		}
+		if !c.namespaceHasNetwork(netName, nsName) {
+			t.Fatal("namespace must be active after a successful add")
+		}
+		if c.getCachedNamespace(netName, nsName) == nil {
+			t.Fatal("namespace must be cached after a successful add")
+		}
+	})
+
+	t.Run("had && has → normal update, oldNS from cache", func(t *testing.T) {
+		c, h := transitionGateFixture(t, netName, func(string) (bool, error) { return true, nil }, makeNS())
+		// Seed prior applied state.
+		prior := makeNS()
+		prior.Annotations = map[string]string{"prior": "yes"}
+		c.setCachedNamespace(netName, prior)
+		c.setNamespaceActive(netName, nsName)
+
+		if err := c.reconcileNamespace(scopedNamespaceQueueKey(nsName, netName)); err != nil {
+			t.Fatalf("reconcileNamespace: %v", err)
+		}
+		if h.reconcileCalls != 1 {
+			t.Fatalf("expected one update dispatch; got %d", h.reconcileCalls)
+		}
+		if h.lastOldNS == nil || h.lastOldNS.Annotations["prior"] != "yes" {
+			t.Fatalf("update path must pass cached oldNS; got %#v", h.lastOldNS)
+		}
+	})
+
+	t.Run("had && !has → delete leg, cache + active cleared", func(t *testing.T) {
+		c, h := transitionGateFixture(t, netName, func(string) (bool, error) { return false, nil }, makeNS())
+		c.setCachedNamespace(netName, makeNS())
+		c.setNamespaceActive(netName, nsName)
+
+		if err := c.reconcileNamespace(scopedNamespaceQueueKey(nsName, netName)); err != nil {
+			t.Fatalf("reconcileNamespace: %v", err)
+		}
+		if h.deleteCalls != 1 || h.reconcileCalls != 0 {
+			t.Fatalf("expected exactly one delete; got reconcile=%d delete=%d", h.reconcileCalls, h.deleteCalls)
+		}
+		if c.namespaceHasNetwork(netName, nsName) {
+			t.Fatal("namespace must be cleared from active set after delete")
+		}
+		if c.getCachedNamespace(netName, nsName) != nil {
+			t.Fatal("namespace cache must be cleared after delete")
+		}
+	})
+
+	t.Run("deletion event + had → delete leg fires", func(t *testing.T) {
+		// No namespace in lister → deletion event.
+		c, h := transitionGateFixture(t, netName, func(string) (bool, error) {
+			t.Fatal("ClaimsNamespace must not be called on deletion path")
+			return false, nil
+		})
+		c.setCachedNamespace(netName, makeNS())
+		c.setNamespaceActive(netName, nsName)
+
+		if err := c.reconcileNamespace(scopedNamespaceQueueKey(nsName, netName)); err != nil {
+			t.Fatalf("reconcileNamespace: %v", err)
+		}
+		if h.deleteCalls != 1 {
+			t.Fatalf("expected exactly one delete on deletion event; got %d", h.deleteCalls)
+		}
+		if c.namespaceHasNetwork(netName, nsName) || c.getCachedNamespace(netName, nsName) != nil {
+			t.Fatal("active + cache must be cleared on deletion")
+		}
+	})
+
+	t.Run("deletion event + !had → no dispatch", func(t *testing.T) {
+		c, h := transitionGateFixture(t, netName, func(string) (bool, error) {
+			t.Fatal("ClaimsNamespace must not be called on deletion path")
+			return false, nil
+		})
+
+		if err := c.reconcileNamespace(scopedNamespaceQueueKey(nsName, netName)); err != nil {
+			t.Fatalf("reconcileNamespace: %v", err)
+		}
+		if h.reconcileCalls != 0 || h.deleteCalls != 0 {
+			t.Fatalf("expected zero handler calls; got reconcile=%d delete=%d", h.reconcileCalls, h.deleteCalls)
+		}
+	})
+
+	t.Run("ClaimsNamespace error → no state mutation", func(t *testing.T) {
+		// Load-bearing test for the (bool, error) signature: the gate
+		// must NOT change cache or active state on the error path,
+		// otherwise a transient lookup failure during NAD-cache warmup
+		// would either spuriously force-add or spuriously delete.
+		want := errors.New("lookup transient failure")
+		c, h := transitionGateFixture(t, netName, func(string) (bool, error) { return false, want }, makeNS())
+		c.setCachedNamespace(netName, makeNS())
+		c.setNamespaceActive(netName, nsName)
+
+		err := c.reconcileNamespace(scopedNamespaceQueueKey(nsName, netName))
+		if err == nil {
+			t.Fatal("expected reconcile to surface ClaimsNamespace error")
+		}
+		if !errors.Is(err, want) {
+			t.Fatalf("expected wrapped %v, got %v", want, err)
+		}
+		if h.reconcileCalls != 0 || h.deleteCalls != 0 {
+			t.Fatalf("handler must not be dispatched on ClaimsNamespace error; got reconcile=%d delete=%d", h.reconcileCalls, h.deleteCalls)
+		}
+		if !c.namespaceHasNetwork(netName, nsName) {
+			t.Fatal("active state must be preserved on ClaimsNamespace error")
+		}
+		if c.getCachedNamespace(netName, nsName) == nil {
+			t.Fatal("cache must be preserved on ClaimsNamespace error")
+		}
+	})
+
+	t.Run("deletion + reconcileDelete error → state preserved for retry", func(t *testing.T) {
+		c, h := transitionGateFixture(t, netName, nil)
+		c.setCachedNamespace(netName, makeNS())
+		c.setNamespaceActive(netName, nsName)
+		// Force the delete leg to fail. reconcileDelete dispatches
+		// ReconcileNamespace(oldNS, nil, ...); to fail it, override
+		// the handler's ReconcileNamespace behavior via reconcileErr.
+		// (deleteCalls increments before the nil-newNS branch returns,
+		// but reconcileErr is only returned on the add path; need a
+		// different signal — extend the fake.)
+		h.deleteErr = errors.New("ovn down")
+
+		err := c.reconcileNamespace(scopedNamespaceQueueKey(nsName, netName))
+		if err == nil {
+			t.Fatal("expected reconcileDelete error to bubble")
+		}
+		if !errors.Is(err, h.deleteErr) {
+			t.Fatalf("expected wrapped %v, got %v", h.deleteErr, err)
+		}
+		// On error, cache + active must NOT be cleared so the next
+		// reconcile retries the delete.
+		if !c.namespaceHasNetwork(netName, nsName) {
+			t.Fatal("active state must be preserved when delete leg errors")
+		}
+		if c.getCachedNamespace(netName, nsName) == nil {
+			t.Fatal("cache must be preserved when delete leg errors")
+		}
+	})
 }
 
 func TestCachedNamespaceRoundtrip(t *testing.T) {

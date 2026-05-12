@@ -306,7 +306,33 @@ func (c *NamespaceController) DeregisterNetworkController(netName string) {
 }
 
 // reconcileNamespace handles namespace add/update/delete by comparing
-// cached state.
+// the cached "applied" state to the handler's current claim, and
+// running the right leg (add / update / delete / no-op).
+//
+// Transition gate, mirroring NodeController.reconcileNode:
+//
+//   - newNS == nil (Kubernetes namespace deleted): membership is
+//     definitionally false. Don't consult the predicate (its data
+//     sources may depend on the now-missing namespace). Run the delete
+//     leg only if we had applied state.
+//   - handler.ClaimsNamespace errors: requeue without mutating active
+//     or cache state. Treating a transient lookup failure as
+//     "doesn't claim" would spuriously delete state on bad data.
+//   - (had, has) matrix:
+//       !had && !has: not ours, never was. No dispatch, no caching.
+//       !had &&  has: inactive → active. Fresh-add semantics.
+//        had && !has: active → inactive (e.g. NAD change moved the
+//                     namespace out of this handler's scope). Delete
+//                     leg, clear cache + active.
+//        had &&  has: normal update with cached prior view.
+//
+// The handler-level membership predicate (ClaimsNamespace) is the one
+// intentional divergence from NodeController, which sources the
+// equivalent fact from networkmanager.NodeHasNetwork. Namespace
+// membership isn't a single network-manager-level fact today (default
+// network claims all; primary UDN claims by NAD; secondary UDN with
+// multi-netpol claims by yet another rule), so the predicate stays on
+// the handler.
 func (c *NamespaceController) reconcileNamespace(key string) error {
 	nsName, netName := parseScopedNamespaceQueueKey(key)
 	// Empty namespace names are not valid Kubernetes namespaces; an
@@ -339,46 +365,82 @@ func (c *NamespaceController) reconcileNamespace(key string) error {
 			return nil
 		}
 
-		needsDelete := c.namespaceNeedsDeleteReconciliation(netName, nsName)
-		needsAddUpdate := true
-
 		newNS, err := c.nsLister.Get(nsName)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
 
-		updateAnnoCacheOnDelete := false
-		if newNS == nil {
-			needsDelete = true
-			needsAddUpdate = false
-			updateAnnoCacheOnDelete = true
-		}
-
 		oldNS := c.getCachedNamespace(netName, nsName)
-		var oldState *NamespaceAnnotationState
-		if oldNS != nil || updateAnnoCacheOnDelete {
-			oldState = c.annotationCache.UpdateNamespaceAnnotationState(oldNS, updateAnnoCacheOnDelete)
-		}
+		had := c.namespaceHasNetwork(netName, nsName)
 
-		if needsDelete {
-			if err := c.reconcileDelete(handler, nsName, netName, oldNS, oldState); err != nil {
-				return fmt.Errorf("%s: failed to delete namespace %s for network %s: %w", c.name, nsName, netName, err)
+		// Deletion special-case. Skip the predicate — namespace is
+		// gone and ClaimsNamespace's data sources may be unreliable.
+		if newNS == nil {
+			var oldState *NamespaceAnnotationState
+			if oldNS != nil {
+				oldState = c.annotationCache.UpdateNamespaceAnnotationState(oldNS, true)
 			}
-		}
-
-		if !needsAddUpdate || newNS == nil {
+			if had {
+				if err := c.reconcileDelete(handler, nsName, netName, oldNS, oldState); err != nil {
+					return fmt.Errorf("%s: failed to delete namespace %s for network %s: %w", c.name, nsName, netName, err)
+				}
+			}
 			c.deleteNamespaceReconciliation(netName, nsName)
 			return nil
 		}
 
-		newState := c.annotationCache.UpdateNamespaceAnnotationState(newNS, true)
+		has, claimErr := handler.ClaimsNamespace(nsName)
+		if claimErr != nil {
+			// No active or cache mutation on the error path; the
+			// workqueue requeues and the next pass will retry.
+			return fmt.Errorf("%s: ClaimsNamespace(%q) for network %q: %w", c.name, nsName, netName, claimErr)
+		}
 
-		// If we've been marked for reconciliation (first-time-active or
-		// bootstrap), treat it as a fresh add by clearing the prior view.
+		switch {
+		case !had && !has:
+			// Not ours, never was. Drain the bootstrap entry (if
+			// any) and return.
+			c.deleteNamespaceReconciliation(netName, nsName)
+			return nil
+
+		case had && !has:
+			// Active → inactive. Closes the NAD-transition gap:
+			// without this branch, the legacy code path would have
+			// run a normal update, the handler would have filtered
+			// and returned nil, and the OVN state programmed for
+			// the previous network would have leaked.
+			var oldState *NamespaceAnnotationState
+			if oldNS != nil {
+				oldState = c.annotationCache.UpdateNamespaceAnnotationState(oldNS, false)
+			}
+			if err := c.reconcileDelete(handler, nsName, netName, oldNS, oldState); err != nil {
+				return fmt.Errorf("%s: failed to delete namespace %s for network %s: %w", c.name, nsName, netName, err)
+			}
+			c.deleteNamespaceReconciliation(netName, nsName)
+			return nil
+
+		case !had && has:
+			// Inactive → active: force-add semantics. Clear the
+			// cached prior view so the handler sees a clean add.
+			oldNS = nil
+		}
+
+		// Fall through: had && has, or force-add from case 3 above.
+		// The namespaceNeedsReconciliation read preserves the
+		// external Mark* signal (still used by
+		// base_network_controller.doReconcile) that requests a
+		// fresh-add reapply for an already-active namespace. Drop
+		// once external callers are gone.
 		if c.namespaceNeedsReconciliation(netName, nsName) {
 			oldNS = nil
-			oldState = nil
 		}
+
+		var oldState *NamespaceAnnotationState
+		if oldNS != nil {
+			oldState = c.annotationCache.UpdateNamespaceAnnotationState(oldNS, false)
+		}
+		newState := c.annotationCache.UpdateNamespaceAnnotationState(newNS, true)
+
 		c.setNamespaceActive(netName, nsName)
 		return c.reconcileUpdate(handler, oldNS, newNS, netName, oldState, newState)
 	})
