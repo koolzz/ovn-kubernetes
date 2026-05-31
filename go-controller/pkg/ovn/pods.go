@@ -315,9 +315,6 @@ func (oc *DefaultNetworkController) addLogicalPort(pod *corev1.Pod) (err error) 
 	for key := range routingPodGWs {
 		gw := routingPodGWs[key]
 		if len(gw.gws) > 0 {
-			if err = validateRoutingPodGWs(routingPodGWs); err != nil {
-				klog.Error(err)
-			}
 			gateways = append(gateways, &gw)
 		} else {
 			klog.Warningf("Found routingPodGW with no gateways ip set for namespace %s", pod.Namespace)

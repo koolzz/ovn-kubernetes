@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"testing"
 	"time"
 
 	nettypes "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
@@ -3714,4 +3715,76 @@ func injectNode(fakeOvn *FakeOVN) {
 	}
 	gomega.ExpectWithOffset(1, fakeOvn.controller.watchFactory.NodeInformer().GetStore().Add(node)).To(gomega.Succeed())
 	fakeOvn.controller.localZoneNodes.Store(node.Name, true)
+}
+
+func TestGatewayPodDeleteTargets(t *testing.T) {
+	// Regression: deletePodExternalGW used to discard the index.Delete
+	// return value and bail when the pod's current annotation was
+	// empty. That left stale routes for namespaces the pod had been
+	// serving when the annotation was cleared in a prior update event
+	// before the pod-delete event arrived.
+	cases := []struct {
+		name       string
+		prior      sets.Set[string]
+		annotation string
+		want       []string
+	}{
+		{
+			name:       "current annotation only",
+			prior:      nil,
+			annotation: "ns-a,ns-b",
+			want:       []string{"ns-a", "ns-b"},
+		},
+		{
+			name:       "prior only — load-bearing for cleared-then-deleted ordering",
+			prior:      sets.New("ns-a", "ns-b"),
+			annotation: "",
+			want:       []string{"ns-a", "ns-b"},
+		},
+		{
+			name:       "both — disjoint sets union",
+			prior:      sets.New("ns-a"),
+			annotation: "ns-b",
+			want:       []string{"ns-a", "ns-b"},
+		},
+		{
+			name:       "both — overlapping",
+			prior:      sets.New("ns-a", "ns-b"),
+			annotation: "ns-b,ns-c",
+			want:       []string{"ns-a", "ns-b", "ns-c"},
+		},
+		{
+			name:       "annotation with whitespace and empty entries",
+			prior:      nil,
+			annotation: "ns-a, ns-b ,,",
+			want:       []string{"ns-a", "ns-b"},
+		},
+		{
+			name:       "empty everywhere — no reconcile",
+			prior:      nil,
+			annotation: "",
+			want:       []string{},
+		},
+		{
+			name:       "empty prior set explicit",
+			prior:      sets.New[string](),
+			annotation: "",
+			want:       []string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := gatewayPodDeleteTargets(tc.prior, tc.annotation)
+			assertElementsMatch(t, tc.want, sets.List(got))
+		})
+	}
+}
+
+func assertElementsMatch(t *testing.T, want, got []string) {
+	t.Helper()
+	wantSet := sets.New(want...)
+	gotSet := sets.New(got...)
+	if !wantSet.Equal(gotSet) {
+		t.Fatalf("set mismatch:\n  want: %v\n   got: %v", want, got)
+	}
 }

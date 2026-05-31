@@ -20,6 +20,7 @@ import (
 
 	hotypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/hybrid-overlay/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	nscontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/namespace"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	egressipv1 "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressip/v1"
 	egressqoslisters "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressqos/v1/apis/listers/egressqos/v1"
@@ -141,6 +142,22 @@ type DefaultNetworkController struct {
 	zoneChassisHandler *zoneic.ZoneChassisHandler
 
 	gatewayTopologyFactory *topology.GatewayTopologyFactory
+
+	// gatewayPodIndex tracks "which gateway pods serve which namespaces"
+	// for the multi-external-gateway feature. Sole source of truth as
+	// of Phase 1b. Bootstrapped from the pod informer cache before
+	// WatchPods runs (see bootstrapGatewayPodIndex); HasSynced() gates
+	// any reader that depends on the index for correctness.
+	gatewayPodIndex *gatewayPodIndex
+
+	// nsAppliedGWState is the per-namespace last-successfully-applied
+	// gateway state. The namespace-driven apply primitive
+	// (reconcileGWStateForNamespace) reads this to compute deltas and
+	// writes back on success. Seeded on controller start by
+	// bootstrapNSAppliedGWState, which walks NBDB for the gateway-pod
+	// static routes and reconstructs the snapshot per-namespace so the
+	// first reconcile after a restart sees the real applied state.
+	nsAppliedGWState *nsAppliedGWState
 }
 
 // NewDefaultNetworkController creates a new OVN controller for creating logical network
@@ -154,10 +171,11 @@ func NewDefaultNetworkController(
 	portCache *PortCache,
 	addressSetManager *addresssetmanager.AddressSetManager,
 	nodeReconciler *nodecontroller.NodeController,
+	nsReconciler *nscontroller.NamespaceController,
 ) (*DefaultNetworkController, error) {
 	stopChan := make(chan struct{})
 	wg := &sync.WaitGroup{}
-	return newDefaultNetworkControllerCommon(cnci, stopChan, wg, nil, networkManager, routeImportManager, observManager, eIPController, portCache, addressSetManager, nodeReconciler)
+	return newDefaultNetworkControllerCommon(cnci, stopChan, wg, nil, networkManager, routeImportManager, observManager, eIPController, portCache, addressSetManager, nodeReconciler, nsReconciler)
 }
 
 func newDefaultNetworkControllerCommon(
@@ -172,9 +190,13 @@ func newDefaultNetworkControllerCommon(
 	portCache *PortCache,
 	addressSetManager *addresssetmanager.AddressSetManager,
 	nodeReconciler *nodecontroller.NodeController,
+	nsReconciler *nscontroller.NamespaceController,
 ) (*DefaultNetworkController, error) {
 	if nodeReconciler == nil {
 		return nil, fmt.Errorf("shared node reconciler is required for the default network controller")
+	}
+	if nsReconciler == nil {
+		return nil, fmt.Errorf("shared namespace reconciler is required for the default network controller")
 	}
 
 	defaultNetInfo := &util.DefaultNetInfo{}
@@ -237,6 +259,7 @@ func newDefaultNetworkControllerCommon(
 			addressSetManager:           addressSetManager,
 			nodeReconciler:              nodeReconciler,
 			nodeAnnotationCache:         nodeReconciler.AnnotationCache(),
+			nsReconciler:                nsReconciler,
 		},
 		externalGatewayRouteInfo:   apbExternalRouteController.ExternalGWRouteInfoCache,
 		eIPC:                       eIPController,
@@ -245,7 +268,13 @@ func newDefaultNetworkControllerCommon(
 		apbExternalRouteController: apbExternalRouteController,
 		svcController:              svcController,
 		gatewayTopologyFactory:     topology.NewGatewayTopologyFactory(cnci.nbClient),
+		gatewayPodIndex:            newGatewayPodIndex(),
+		nsAppliedGWState:           newNSAppliedGWState(),
 	}
+	// Back-reference for the legacy WatchNamespaces test entry point;
+	// production paths register through the shared NamespaceController
+	// directly. See BaseNetworkController.nsHandlerSelf for the rationale.
+	oc.nsHandlerSelf = oc
 	// Allocate IPs for logical router port "GwRouterToJoinSwitchPrefix + OVNClusterRouter". This should always
 	// allocate the first IPs in the join switch subnets.
 	gwLRPIfAddrs, err := oc.getOVNClusterRouterPortToJoinSwitchIfAddrs()
@@ -262,15 +291,33 @@ func newDefaultNetworkControllerCommon(
 	return oc, nil
 }
 
+// bootstrapGatewayPodIndex populates oc.gatewayPodIndex from the pod
+// informer cache and flips its HasSynced() flag to true. Must complete
+// before WatchPods starts so the gateway-pod handler sees a warm index.
+func (oc *DefaultNetworkController) bootstrapGatewayPodIndex() error {
+	if oc.gatewayPodIndex == nil {
+		// Defensive: should never happen — the constructor always
+		// populates this field.
+		oc.gatewayPodIndex = newGatewayPodIndex()
+	}
+	pods, err := oc.watchFactory.GetAllPods()
+	if err != nil {
+		return fmt.Errorf("listing pods: %w", err)
+	}
+	oc.gatewayPodIndex.BootstrapFromPodList(pods)
+	return nil
+}
+
 func (oc *DefaultNetworkController) initRetryFramework() {
-	// Init the retry framework for pods, namespaces, network policies, egress firewalls,
+	// Init the retry framework for pods, network policies, egress firewalls,
 	// egress IP (and dependent namespaces, pods, nodes), cloud private ip config.
+	// Namespace handling is on the shared NamespaceController and no longer
+	// uses a per-controller retry framework.
 	oc.retryPods = oc.newRetryFramework(factory.PodType)
 	oc.retryEgressIPs = oc.newRetryFramework(factory.EgressIPType)
 	oc.retryEgressIPNamespaces = oc.newRetryFramework(factory.EgressIPNamespaceType)
 	oc.retryEgressIPPods = oc.newRetryFramework(factory.EgressIPPodType)
 	oc.retryEgressNodes = oc.newRetryFramework(factory.EgressNodeType)
-	oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
 	oc.retryNetworkPolicies = oc.newRetryFramework(factory.PolicyType)
 }
 
@@ -344,6 +391,7 @@ func (oc *DefaultNetworkController) Start(ctx context.Context) error {
 // Stop gracefully stops the controller
 func (oc *DefaultNetworkController) Stop() {
 	oc.DeregisterNodeHandler()
+	oc.DeregisterNamespaceHandler()
 	if oc.dnsNameResolver != nil {
 		oc.dnsNameResolver.Shutdown()
 	}
@@ -656,9 +704,36 @@ func (oc *DefaultNetworkController) run(_ context.Context) error {
 	klog.Info("Starting all the Watchers...")
 	start := time.Now()
 
-	// WatchNamespaces() should be started first because it has no other
-	// dependencies, and node startup depends on it.
-	if err := WithSyncDurationMetric("namespace", oc.WatchNamespaces); err != nil {
+	// Prime the gateway-pod index from the informer cache before any
+	// per-namespace reconcile fires; namespace reconcile reads
+	// (annotation + index) to compute desired gateway state, and an
+	// empty index would yield an incomplete desired-state diff.
+	if err := oc.bootstrapGatewayPodIndex(); err != nil {
+		return fmt.Errorf("failed to bootstrap gateway-pod index: %w", err)
+	}
+	// Seed nsAppliedGWState from NBDB so the first per-namespace
+	// reconcile after restart sees the real applied state, not an
+	// empty snapshot. Without this seeding, a namespace whose
+	// annotation has been cleared while the controller was down would
+	// have desired=empty and applied=empty — no delete delta fires and
+	// stale OVN gateway routes leak forever.
+	if err := oc.bootstrapNSAppliedGWState(); err != nil {
+		return fmt.Errorf("failed to bootstrap ns applied gateway state: %w", err)
+	}
+
+	// Namespace handling for the default network now flows through the
+	// shared NamespaceController (Phase 3a). registerNamespaceReconciler
+	// runs SyncNamespaces, enqueues per-ns reconciles, AND blocks on
+	// WaitForBootstrap so the legacy WatchNamespaces ordering contract
+	// holds — node startup, WatchPods, and WatchNetworkPolicy below all
+	// start only after every existing namespace has been processed once
+	// (first reconcile attempt completed; failures left to normal
+	// retry). Without the drain, a NetworkPolicy add could race the
+	// namespace's first AddNamespace, miss the port group, and stay
+	// unenforced.
+	if err := WithSyncDurationMetric("namespace", func() error {
+		return oc.registerNamespaceReconciler(oc)
+	}); err != nil {
 		return err
 	}
 
@@ -1066,13 +1141,6 @@ func (h *defaultNetworkControllerEventHandler) AddResource(obj interface{}, from
 		}
 		return nil
 
-	case factory.NamespaceType:
-		ns, ok := obj.(*corev1.Namespace)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *corev1.Namespace", obj)
-		}
-		return h.oc.AddNamespace(ns)
-
 	default:
 		return h.oc.AddResourceCommon(h.objType, obj)
 	}
@@ -1143,10 +1211,6 @@ func (h *defaultNetworkControllerEventHandler) UpdateResource(oldObj, newObj int
 			h.oc.syncEIPNodeFailed.Delete(newNode.Name)
 		}
 		return nil
-
-	case factory.NamespaceType:
-		oldNs, newNs := oldObj.(*corev1.Namespace), newObj.(*corev1.Namespace)
-		return h.oc.updateNamespace(oldNs, newNs)
 	}
 	return fmt.Errorf("no update function for object type %s", h.objType)
 }
@@ -1192,10 +1256,6 @@ func (h *defaultNetworkControllerEventHandler) DeleteResource(obj, cachedObj int
 		h.oc.syncEIPNodeFailed.Delete(node.Name)
 		return nil
 
-	case factory.NamespaceType:
-		ns := obj.(*corev1.Namespace)
-		return h.oc.deleteNamespace(ns)
-
 	default:
 		return h.oc.DeleteResourceCommon(h.objType, obj)
 	}
@@ -1224,9 +1284,6 @@ func (h *defaultNetworkControllerEventHandler) SyncFunc(objs []interface{}) erro
 		case factory.EgressIPNamespaceType,
 			factory.EgressIPType:
 			syncFunc = nil
-
-		case factory.NamespaceType:
-			syncFunc = h.oc.syncNamespaces
 
 		default:
 			return fmt.Errorf("no sync function for object type %s", h.objType)

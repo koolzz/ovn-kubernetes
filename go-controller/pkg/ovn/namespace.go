@@ -5,7 +5,6 @@ package ovn
 
 import (
 	"fmt"
-	"net"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,67 +16,46 @@ import (
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
-	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
-	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 	utilerrors "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util/errors"
 )
 
-func (oc *DefaultNetworkController) getRoutingExternalGWs(nsInfo *namespaceInfo) *gatewayInfo {
-	res := gatewayInfo{}
-	// return a copy of the object so it can be handled without the
-	// namespace locked
-	res.bfdEnabled = nsInfo.routingExternalGWs.bfdEnabled
-	res.gws = sets.New(nsInfo.routingExternalGWs.gws.UnsortedList()...)
-	return &res
-}
-
-// wrapper function to log if there are duplicate gateway IPs present in the cache
-func validateRoutingPodGWs(podGWs map[string]gatewayInfo) error {
-	// map to hold IP/podName
-	ipTracker := make(map[string]string)
-	for podName, gwInfo := range podGWs {
-		for _, gwIP := range gwInfo.gws.UnsortedList() {
-			if foundPod, ok := ipTracker[gwIP]; ok {
-				return fmt.Errorf("duplicate IP found in ECMP Pod route cache! IP: %q, first pod: %q, second "+
-					"pod: %q", gwIP, podName, foundPod)
-			}
-			ipTracker[gwIP] = podName
-		}
-	}
-	return nil
-}
-
-func (oc *DefaultNetworkController) getRoutingPodGWs(nsInfo *namespaceInfo) map[string]gatewayInfo {
-	// return a copy of the object so it can be handled without the
-	// namespace locked
-	res := make(map[string]gatewayInfo)
-	for k, v := range nsInfo.routingExternalPodGWs {
-		item := gatewayInfo{
-			bfdEnabled: v.bfdEnabled,
-			gws:        sets.New(v.gws.UnsortedList()...),
-		}
-		res[k] = item
-	}
-	return res
-}
-
 // addLocalPodToNamespace returns pod's routing gateway info and the ops needed
 // to add pod's IP to the namespace's address set and port group.
+//
+// Both gateway sources are read from their post-migration owners:
+//   - per-gateway-pod entries from gatewayPodIndex.
+//   - annotation-derived entries parsed directly from the namespace
+//     informer object (parseAnnotationGWs uses the same parser the
+//     apply primitive uses, so the pod-add path and namespace reconcile
+//     see the same desired state for any single namespace event).
 func (oc *DefaultNetworkController) addLocalPodToNamespace(ns string, portUUID string) (*gatewayInfo, map[string]gatewayInfo, []ovsdb.Operation, error) {
-	var err error
 	nsInfo, nsUnlock, err := oc.ensureNamespaceLocked(ns, true, nil)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to ensure namespace locked: %v", err)
 	}
-
 	defer nsUnlock()
 
 	ops, err := oc.addLocalPodToNamespaceLocked(nsInfo, portUUID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return oc.getRoutingExternalGWs(nsInfo), oc.getRoutingPodGWs(nsInfo), ops, nil
+
+	annoGWs := &gatewayInfo{gws: sets.New[string]()}
+	if nsObj, err := oc.watchFactory.GetNamespace(ns); err == nil && nsObj != nil {
+		parsed := parseAnnotationGWs(nsObj)
+		if parsed.gws != nil {
+			annoGWs.gws = sets.New(parsed.gws.UnsortedList()...)
+		}
+		annoGWs.bfdEnabled = parsed.bfdEnabled
+	}
+	var podGWs map[string]gatewayInfo
+	if oc.gatewayPodIndex != nil {
+		podGWs = oc.gatewayPodIndex.PerPodGatewaysForNamespace(ns)
+	} else {
+		podGWs = map[string]gatewayInfo{}
+	}
+	return annoGWs, podGWs, ops, nil
 }
 
 func isNamespaceMulticastEnabled(annotations map[string]string) bool {
@@ -107,19 +85,21 @@ func (oc *DefaultNetworkController) configureNamespace(nsInfo *namespaceInfo, ns
 	var errors []error
 
 	if annotation, ok := ns.Annotations[util.RoutingExternalGWsAnnotation]; ok {
-		exGateways, err := util.ParseRoutingExternalGWAnnotation(annotation)
-		if err != nil {
+		// We still parse the annotation here so a malformed value is
+		// surfaced through the handler's error return; the parsed
+		// value itself is consumed by the apply primitive below, which
+		// re-parses from the same namespace object.
+		if _, err := util.ParseRoutingExternalGWAnnotation(annotation); err != nil {
 			errors = append(errors, fmt.Errorf("failed to parse external gateway annotation (%v)", err))
-		} else {
-			_, bfdEnabled := ns.Annotations[util.BfdAnnotation]
-			err = oc.addExternalGWsForNamespace(gatewayInfo{gws: exGateways, bfdEnabled: bfdEnabled}, nsInfo, ns.Name)
-			if err != nil {
-				errors = append(errors, fmt.Errorf("failed to add external gateway for namespace %s (%v)", ns.Name, err))
-			}
 		}
-		if _, ok := ns.Annotations[util.BfdAnnotation]; ok {
-			nsInfo.routingExternalGWs.bfdEnabled = true
-		}
+	}
+
+	// Drive route programming through the namespace-level apply
+	// primitive. It reads desired state from (annotation +
+	// gatewayPodIndex), diffs against the applied snapshot, and
+	// invokes the existing add/delete primitives idempotently.
+	if err := oc.reconcileGWStateForNamespace(ns.Name); err != nil {
+		errors = append(errors, fmt.Errorf("failed to apply gateway state for namespace %s: %v", ns.Name, err))
 	}
 
 	if err := oc.configureNamespaceCommon(nsInfo, ns); err != nil {
@@ -145,110 +125,50 @@ func (oc *DefaultNetworkController) updateNamespace(old, newer *corev1.Namespace
 	_, oldBFDEnabled := old.Annotations[util.BfdAnnotation]
 
 	if gwAnnotation != oldGWAnnotation || newBFDEnabled != oldBFDEnabled {
-		// if old gw annotation was empty, new one must not be empty, so we should remove any per pod SNAT towards nodeIP
-		if oldGWAnnotation == "" {
-			if config.Gateway.DisableSNATMultipleGWs {
-				existingPods, err := oc.watchFactory.GetPods(old.Name)
-				if err != nil {
-					errors = append(errors, fmt.Errorf("failed to get all the pods (%v)", err))
-				}
-				for _, pod := range existingPods {
-					if !oc.isPodScheduledinLocalZone(pod) {
-						continue
-					}
-
-					logicalPort := util.GetLogicalPortName(pod.Namespace, pod.Name)
-					if util.PodWantsHostNetwork(pod) {
-						continue
-					}
-					podIPs, err := util.GetPodIPsOfNetwork(pod, oc.GetNetInfo(), nil)
-					if err != nil {
-						errors = append(errors, fmt.Errorf("unable to get pod %q IPs for SNAT rule removal err (%v)", logicalPort, err))
-					}
-					ips := make([]*net.IPNet, 0, len(podIPs))
-					for _, podIP := range podIPs {
-						ips = append(ips, &net.IPNet{IP: podIP})
-					}
-					if len(ips) > 0 {
-						if extIPs, err := getExternalIPsGR(oc.watchFactory, pod.Spec.NodeName); err != nil {
-							errors = append(errors, err)
-						} else if err = oc.deletePodSNAT(pod.Spec.NodeName, extIPs, ips); err != nil {
-							errors = append(errors, err)
-						}
-					}
-				}
-			}
-		} else {
-			if err := oc.deleteGWRoutesForNamespace(old.Name, nil); err != nil {
+		// Surface a parse error to the caller; the apply primitive
+		// below consumes the parsed annotation directly off the
+		// namespace object, so no nsInfo write is required here.
+		if gwAnnotation != "" {
+			if _, err := util.ParseRoutingExternalGWAnnotation(gwAnnotation); err != nil {
 				errors = append(errors, err)
 			}
-			nsInfo.routingExternalGWs = gatewayInfo{}
 		}
-		exGateways, err := util.ParseRoutingExternalGWAnnotation(gwAnnotation)
-		if err != nil {
-			errors = append(errors, err)
-		} else {
-			if exGateways.Len() != 0 {
-				err = oc.addExternalGWsForNamespace(gatewayInfo{gws: exGateways, bfdEnabled: newBFDEnabled}, nsInfo, old.Name)
-				if err != nil {
-					errors = append(errors, err)
-				}
-			}
+		// reconcileGWStateForNamespace drives both the route deltas and
+		// the IC-mode-specific side effects (annotation patch /
+		// conntrack flush) — see applyGWStateSideEffects in
+		// gw_state_reconcile.go. The "gateway-added → drop existing
+		// per-pod SNAT" cleanup that used to live here is redundant
+		// now: addGWRoutesForNamespace inside the apply primitive
+		// already calls deletePodSNAT per pod (see
+		// egressgw.go:addGWRoutesForNamespace) when DisableSNATMultipleGWs.
+		if err := oc.reconcileGWStateForNamespace(old.Name); err != nil {
+			errors = append(errors, fmt.Errorf("failed to apply gateway state for namespace %s: %v", old.Name, err))
 		}
-		if oc.zone != types.OvnDefaultZone {
-			// In multi-zone interconnect, ovnkube-controller flushes conntrack
-			// directly here rather than using the "k8s.ovn.org/external-gw-pod-ips"
-			// namespace annotation that ovnkube-node watches in single-zone
-			// deployments.
-			gatewayIPs, err := oc.apbExternalRouteController.GetAdminPolicyBasedExternalRouteIPsForTargetNamespace(old.Name)
-			if err != nil {
-				return fmt.Errorf("unable to retrieve gateway IPs for Admin Policy Based External Route objects for namespace %s: %w", old.Name, err)
-			}
-			for _, gwInfo := range nsInfo.routingExternalPodGWs {
-				gatewayIPs.Insert(gwInfo.gws.UnsortedList()...)
-			}
-			gatewayIPs.Insert(nsInfo.routingExternalGWs.gws.UnsortedList()...)
-			err = oc.syncConntrackForExternalGateways(old.Name, gatewayIPs) // best effort
-			if err != nil {
-				klog.Errorf("Syncing conntrack entries for egressGWs %+v serving the namespace %s failed: %v",
-					gatewayIPs, old.Name, err)
-			}
+		// "Gateway-removed → restore per-pod SNAT": fan out per-pod
+		// reconcile via the level-driven ReconcilePod entry point. The
+		// pod controller's add path re-runs, sees no gateways for the
+		// namespace, and programs SNAT through its own normal flow —
+		// no inline SNAT op-construction in the namespace handler.
+		// HasActiveGWPods (not PodsForNamespace) is the right gate
+		// here: inactive payloads — pods kept in the index but not
+		// ready or without resolved gateway IPs — must NOT prevent
+		// the SNAT restore. Otherwise, removing the last namespace
+		// annotation while only an inactive pod candidate remained
+		// would leave per-pod SNAT torn down even though no active
+		// external gateway is left.
+		hasActiveGWPods := false
+		if oc.gatewayPodIndex != nil {
+			hasActiveGWPods = oc.gatewayPodIndex.HasActiveGWPods(old.Name)
 		}
-		// if new annotation is empty, exgws were removed, may need to add SNAT per pod
-		// check if there are any pod gateways serving this namespace as well
-		if gwAnnotation == "" && len(nsInfo.routingExternalPodGWs) == 0 && config.Gateway.DisableSNATMultipleGWs {
+		if gwAnnotation == "" && !hasActiveGWPods && config.Gateway.DisableSNATMultipleGWs {
 			existingPods, err := oc.watchFactory.GetPods(old.Name)
 			if err != nil {
-				errors = append(errors, fmt.Errorf("failed to get all the pods (%v)", err))
+				errors = append(errors, fmt.Errorf("failed to list pods for SNAT fan-out: %v", err))
 			}
 			for _, pod := range existingPods {
-				if !oc.isPodScheduledinLocalZone(pod) && !util.PodNeedsSNAT(pod) {
-					continue
-				}
-				podAnnotation, err := util.UnmarshalPodAnnotation(pod.Annotations, types.DefaultNetworkName)
-				if err != nil {
-					errors = append(errors, err)
-				} else {
-					// Helper function to handle the complex SNAT operations
-					handleSNATOps := func() error {
-						ops, err := oc.AddPodSNATOps(pod.Spec.NodeName, podAnnotation.IPs)
-						if err != nil {
-							return err
-						}
-
-						// Execute all operations in a single transaction
-						if len(ops) > 0 {
-							_, err = libovsdbops.TransactAndCheck(oc.nbClient, ops)
-							if err != nil {
-								return fmt.Errorf("failed to update SNAT for pod %s on router %s: %v", pod.Name, oc.GetNetworkScopedGWRouterName(pod.Spec.NodeName), err)
-							}
-						}
-						return nil
-					}
-
-					if err := handleSNATOps(); err != nil {
-						errors = append(errors, err)
-					}
+				podKey := pod.Namespace + "/" + pod.Name
+				if err := oc.ReconcilePod(podKey); err != nil {
+					errors = append(errors, fmt.Errorf("failed to enqueue pod %s for SNAT reconcile: %v", podKey, err))
 				}
 			}
 		}
@@ -289,6 +209,26 @@ func (oc *DefaultNetworkController) updateNamespace(old, newer *corev1.Namespace
 func (oc *DefaultNetworkController) deleteNamespace(ns *corev1.Namespace) error {
 	klog.Infof("[%s] deleting namespace", ns.Name)
 
+	// Gateway-route teardown runs FIRST, before deleteNamespaceLocked
+	// removes nsInfo from bnc.namespaces. It is retryable and needs
+	// neither nsInfo nor the namespace lock: computeDesiredGWStateForNamespace
+	// reads the (now-absent) namespace from the informer, returns empty
+	// desired state (it does NOT merge the gateway-pod index for a
+	// missing namespace — a deleted namespace has no pods to route, so
+	// a straggler gateway pod still targeting this name must not keep
+	// desired non-empty), the diff produces a full delete delta, and
+	// the snapshot is cleared on success.
+	//
+	// Ordering matters: if this ran AFTER deleteNamespaceLocked, a
+	// retryable failure here would return an error, but the retry's
+	// deleteNamespaceLocked would find nsInfo already gone, return
+	// (nil, nil), and the nsInfo==nil branch below would report
+	// success WITHOUT re-running the gateway teardown — leaking a
+	// stale snapshot and skipping the side-effect retry.
+	if err := oc.reconcileGWStateForNamespace(ns.Name); err != nil {
+		return fmt.Errorf("failed to apply gateway state teardown for namespace %s: %v", ns.Name, err)
+	}
+
 	nsInfo, err := oc.deleteNamespaceLocked(ns.Name)
 	if err != nil {
 		return err
@@ -298,9 +238,6 @@ func (oc *DefaultNetworkController) deleteNamespace(ns *corev1.Namespace) error 
 	}
 	defer nsInfo.Unlock()
 
-	if err := oc.deleteGWRoutesForNamespace(ns.Name, nil); err != nil {
-		return fmt.Errorf("failed to delete GW routes for namespace: %s, error: %v", ns.Name, err)
-	}
 	if err := oc.multicastDeleteNamespace(ns, nsInfo); err != nil {
 		return fmt.Errorf("failed to delete multicast namespace error %v", err)
 	}

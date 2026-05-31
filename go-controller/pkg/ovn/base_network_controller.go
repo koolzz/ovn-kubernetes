@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	ref "k8s.io/client-go/tools/reference"
 	"k8s.io/klog/v2"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/allocator/pod"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	nscontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/namespace"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube"
@@ -95,8 +97,6 @@ type BaseNetworkController struct {
 
 	// retry framework for pods
 	retryPods *ovnretry.RetryFramework
-	// retry framework for namespaces
-	retryNamespaces *ovnretry.RetryFramework
 	// retry framework for network policies
 	retryNetworkPolicies *ovnretry.RetryFramework
 	// retry framework for network policies
@@ -110,10 +110,32 @@ type BaseNetworkController struct {
 	// node annotation cache for shared node controllers (optional)
 	nodeAnnotationCache *nodecontroller.NodeAnnotationCache
 
+	// nsReconciler is the shared namespace controller used by
+	// controllers that reconcile namespace state through
+	// pkg/controllers/namespace. Optional today: only the default
+	// network registers a handler in Phase 3a; UDNs follow in 3b.
+	nsReconciler *nscontroller.NamespaceController
+
+	// nsHandlerSelf is a back-reference to the concrete controller
+	// (DefaultNetworkController or *BaseUserDefinedNetworkController-
+	// embedding type) so that the test-only WatchNamespaces() entry
+	// point on the base type can register itself with the shared
+	// NamespaceController. Set by each concrete controller's
+	// constructor after the embedded base is built. Production paths
+	// call registerNamespaceReconciler directly from each controller's
+	// run() with the concrete handler and don't rely on this
+	// back-reference; it exists solely for the WatchNamespaces test
+	// shim. A future cleanup that migrates the ~99 test callsites onto
+	// the new path can drop both the field and the shim together.
+	nsHandlerSelf nscontroller.NamespaceHandler
+
 	// pod events factory handler
 	podHandler *factory.Handler
-	// namespace events factory Handler
-	namespaceHandler *factory.Handler
+	// namespacesRegistered tracks whether the test-only WatchNamespaces
+	// shim has already registered this controller with the shared
+	// NamespaceController. The shim short-circuits when this is true
+	// so repeated calls in the same test setup are safe.
+	namespacesRegistered bool
 	// ipam claims events factory Handler
 	ipamClaimsHandler *factory.Handler
 
@@ -216,13 +238,9 @@ func (oc *BaseNetworkController) reconcile(netInfo util.NetInfo, setNodeFailed f
 	reconcileRoutes := oc.routeImportManager != nil && oc.routeImportManager.NeedsReconciliation(netInfo)
 	nadKeys := oc.networkManager.GetNADKeysForNetwork(netInfo.GetNetworkName())
 	reconcilePendingPods := !oc.IsDefault() && oc.updateNADKeysChanged(nadKeys)
-	reconcileNamespaces := sets.NewString()
+	reconcileNamespaces := []string{}
 	if oc.IsPrimaryNetwork() {
-		// since CanServeNamespace filters out namespace events for namespaces unknown
-		// to be served by this primary network, we need to reconcile namespaces once
-		// the network is reconfigured to serve a namespace.
-		reconcileNamespaces = sets.NewString(netInfo.GetNADNamespaces()...).Difference(
-			sets.NewString(oc.GetNADNamespaces()...))
+		reconcileNamespaces = nadNamespacesNeedingReconcile(oc.GetNADNamespaces(), netInfo.GetNADNamespaces())
 	}
 
 	// set the new NetInfo, point of no return
@@ -230,7 +248,29 @@ func (oc *BaseNetworkController) reconcile(netInfo util.NetInfo, setNodeFailed f
 	if err != nil {
 		return fmt.Errorf("failed to reconcile network information for network %s: %v", oc.GetNetworkName(), err)
 	}
-	return oc.doReconcile(reconcileRoutes, reconcilePendingPods, reconcileNodes, setNodeFailed, reconcileNamespaces.List())
+	return oc.doReconcile(reconcileRoutes, reconcilePendingPods, reconcileNodes, setNodeFailed, reconcileNamespaces)
+}
+
+// nadNamespacesNeedingReconcile returns the set of namespaces whose
+// NAD-set membership for this network is changing — added on this
+// transition or removed on this transition. Namespaces present in both
+// sets are unchanged for this network and need no reconcile.
+//
+// Both transitions must be enqueued: the per-namespace event path does
+// NOT fire for a namespace that has merely lost network membership
+// (the namespace object itself didn't change), so without enqueuing
+// removed namespaces here the shared-controller transition gate
+// (had && !has) cannot fire and OVN state for the previous owner
+// leaks. Mirrors the services-controller behavior of re-syncing both
+// sides of a NAD-set change.
+//
+// SymmetricDifference is the right primitive — not Union — because
+// namespaces in the intersection have stable membership for this
+// network and re-reconciling them would be wasted work.
+func nadNamespacesNeedingReconcile(oldNADNamespaces, newNADNamespaces []string) []string {
+	return sets.NewString(newNADNamespaces...).
+		SymmetricDifference(sets.NewString(oldNADNamespaces...)).
+		List()
 }
 
 func clusterSubnetsChanged(old, new util.NetInfo) bool {
@@ -286,22 +326,14 @@ func (oc *BaseNetworkController) doReconcile(reconcileRoutes, reconcilePendingPo
 	// network controller creates the address set for the namespace.
 	// To update gress policy ACLs with peer namespace address set, invoke requeuePeerNamespace method after
 	// address set is created for the namespace.
-	namespaceAdded := false
-	for _, ns := range reconcileNamespaces {
-		namespace, err := oc.watchFactory.GetNamespace(ns)
-		if err != nil {
-			klog.Infof("Failed to get namespace %s for reconciling network %s: %v", ns, oc.GetNetworkName(), err)
-			continue
+	if oc.nsReconciler != nil {
+		for _, ns := range reconcileNamespaces {
+			// The shared controller's (had, has) gate derives the
+			// right leg (fresh-add for newly-claimed, delete for
+			// no-longer-claimed) from cached state on its own, so a
+			// plain enqueue is sufficient — no explicit mark needed.
+			oc.nsReconciler.ReconcileNetwork(ns, oc.GetNetworkName())
 		}
-		err = oc.retryNamespaces.AddRetryObjWithAddNoBackoff(namespace)
-		if err != nil {
-			klog.Infof("Failed to retry namespace %s for network %s: %v", ns, oc.GetNetworkName(), err)
-			continue
-		}
-		namespaceAdded = true
-	}
-	if namespaceAdded {
-		oc.retryNamespaces.RequestRetryObjs()
 	}
 	return nil
 }
@@ -309,6 +341,78 @@ func (oc *BaseNetworkController) doReconcile(reconcileRoutes, reconcilePendingPo
 // DeregisterNodeHandler removes this controller from the shared node controller.
 func (oc *BaseNetworkController) DeregisterNodeHandler() {
 	oc.nodeReconciler.DeregisterNetworkController(oc.GetNetworkName())
+}
+
+// DeregisterNamespaceHandler removes this controller from the shared
+// namespace controller. No-op if the controller never registered.
+func (oc *BaseNetworkController) DeregisterNamespaceHandler() {
+	if oc.nsReconciler == nil {
+		return
+	}
+	oc.nsReconciler.DeregisterNetworkController(oc.GetNetworkName())
+}
+
+// ReconcilePod re-enqueues the pod identified by key (namespace/name)
+// for the existing pod-add path. Reads the pod from the informer
+// cache and drives it through retryPods.AddRetryObjWithAddNoBackoff,
+// then signals the retry loop to iterate. Callers fan out per-namespace
+// pod sets through this entry point instead of walking pods inline,
+// which keeps the per-pod work owned by the pod controller and makes
+// the namespace reconcile shape level-driven.
+//
+// Returns nil for a key whose pod is gone from the informer (no work
+// needed) and for a malformed key (logged but not propagated, since
+// the caller is typically driving best-effort fan-out).
+func (oc *BaseNetworkController) ReconcilePod(podKey string) error {
+	if oc.retryPods == nil {
+		return nil
+	}
+	namespace, name, err := cache.SplitMetaNamespaceKey(podKey)
+	if err != nil {
+		klog.Errorf("ReconcilePod: invalid pod key %q: %v", podKey, err)
+		return nil
+	}
+	pod, err := oc.watchFactory.GetPod(namespace, name)
+	if err != nil {
+		// Pod gone from the informer cache; no reconcile needed. The
+		// pod handler's delete path has already (or will) tear down
+		// the OVN state via the standard event flow.
+		return nil
+	}
+	if err := oc.retryPods.AddRetryObjWithAddNoBackoff(pod); err != nil {
+		return fmt.Errorf("ReconcilePod: failed to enqueue pod %s: %w", podKey, err)
+	}
+	oc.retryPods.RequestRetryObjs()
+	return nil
+}
+
+// registerNamespaceReconciler wires the given handler into the shared
+// NamespaceController. Mirrors the gate that legacy WatchNamespaces
+// used: networks that don't need namespace events (e.g. a secondary
+// network with multi-netpol disabled) skip registration entirely.
+//
+// Synchronous bootstrap contract: RegisterNetworkController only
+// SyncNamespaces + enqueues per-namespace reconciles; it does NOT
+// wait for the workqueue to drain. Block here on WaitForBootstrap so
+// dependent watchers (NetworkPolicy, Pods) start only after every
+// existing namespace has been PROCESSED ONCE (first reconcile
+// attempt completed — not necessarily applied successfully; a failed
+// namespace stays in the workqueue retry path). This preserves the
+// legacy WatchNamespaces ordering contract: a NetworkPolicy add
+// shouldn't race a namespace's first AddNamespace, miss the port
+// group, and stay unenforced until retry.
+func (oc *BaseNetworkController) registerNamespaceReconciler(handler nscontroller.NamespaceHandler) error {
+	if !oc.shouldWatchNamespaces() {
+		klog.Infof("Ignoring namespaces events for network: %s", oc.GetNetworkName())
+		return nil
+	}
+	if err := oc.nsReconciler.RegisterNetworkController(handler); err != nil {
+		return err
+	}
+	if err := oc.nsReconciler.WaitForBootstrap(oc.GetNetworkName(), 30*time.Second); err != nil {
+		return fmt.Errorf("namespace bootstrap drain failed for network %s: %w", oc.GetNetworkName(), err)
+	}
+	return nil
 }
 
 // BaseUserDefinedNetworkController structure holds per-network fields and network specific
@@ -323,24 +427,18 @@ type BaseUserDefinedNetworkController struct {
 }
 
 func (oc *BaseUserDefinedNetworkController) FilterOutResource(objType reflect.Type, obj interface{}) bool {
-	switch objType {
-	case factory.NamespaceType:
-		ns, ok := obj.(*corev1.Namespace)
-		if !ok {
-			klog.Errorf("Failed to cast the provided object to a namespace")
-			return false
-		}
-		return oc.shouldFilterNamespace(ns.Name)
-	case factory.PodType:
+	// Namespace events flow through the shared NamespaceController and
+	// are filtered there; only the per-network retry framework's
+	// remaining types (currently PodType) need filtering here.
+	if objType == factory.PodType {
 		pod, ok := obj.(*corev1.Pod)
 		if !ok {
 			klog.Errorf("Failed to cast the provided object to a pod")
 			return false
 		}
 		return oc.shouldFilterNamespace(pod.GetNamespace())
-	default:
-		return false
 	}
+	return false
 }
 
 func (oc *BaseUserDefinedNetworkController) shouldFilterNamespace(namespace string) bool {
@@ -361,6 +459,39 @@ func (oc *BaseUserDefinedNetworkController) shouldFilterNamespace(namespace stri
 		return !util.CanServeNamespace(oc.GetNetInfo(), namespace)
 	}
 	return networkName != oc.GetNetworkName()
+}
+
+// ClaimsNamespace implements NamespaceHandler for User Defined Networks.
+// It is the !shouldFilterNamespace twin, with one critical difference:
+// transient lookup errors (e.g. GetPrimaryNADForNamespace returning an
+// InvalidPrimaryNetworkError because the NAD cache hasn't caught up) are
+// surfaced to the shared namespace controller so the reconcile can be
+// requeued instead of silently treating the namespace as belonging.
+// shouldFilterNamespace remains in place for the per-network retry pod
+// filter (FilterOutResource), where the legacy swallow-on-error
+// behavior is preserved deliberately.
+func (oc *BaseUserDefinedNetworkController) ClaimsNamespace(nsName string) (bool, error) {
+	if !oc.IsPrimaryNetwork() || oc.networkManager == nil {
+		return util.CanServeNamespace(oc.GetNetInfo(), nsName), nil
+	}
+	nadKey, err := oc.networkManager.GetPrimaryNADForNamespace(nsName)
+	if err != nil {
+		return false, err
+	}
+	if nadKey == "" {
+		// Namespace not found in the lister — treat as not claimed.
+		// The shared controller's deletion special-case handles the
+		// "we had it cached" path separately, so this is safe.
+		return false, nil
+	}
+	if nadKey == types.DefaultNetworkName {
+		return false, nil
+	}
+	networkName := oc.networkManager.GetNetworkNameForNADKey(nadKey)
+	if networkName == "" {
+		return util.CanServeNamespace(oc.GetNetInfo(), nsName), nil
+	}
+	return networkName == oc.GetNetworkName(), nil
 }
 
 func getNetworkControllerName(netName string) string {

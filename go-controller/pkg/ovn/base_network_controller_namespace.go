@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,23 +38,15 @@ type namespaceInfo struct {
 	// May be empty if the port group wasn't created.
 	portGroupName string
 
-	// Map of related network policies. Policy will add itself to this list when it's ready to subscribe
-	// to namespace Update events. Retry logic to update network policy based on namespace event is handled by namespace.
-	// Policy should only be added after successful create, and deleted before any network policy resources are deleted.
-	// This is the map of keys that can be used to get networkPolicy from oc.networkPolicies.
-	//
-	// You must hold the namespaceInfo's mutex to add/delete dependent policies.
-	// Namespace can take oc.networkPolicies key Lock while holding nsInfo lock, the opposite should never happen.
-	relatedNetworkPolicies map[string]bool
-
-	// routingExternalGWs is a slice of net.IP containing the values parsed from
-	// annotation k8s.ovn.org/routing-external-gws
-	routingExternalGWs gatewayInfo
-
-	// routingExternalPodGWs contains a map of all pods serving as exgws as well as their
-	// exgw IPs
-	// key is <namespace>_<pod name>
-	routingExternalPodGWs map[string]gatewayInfo
+	// External-gateway state has been moved off namespaceInfo:
+	//  - annotation-derived GWs (formerly routingExternalGWs) are read
+	//    directly from the namespace informer via parseAnnotationGWs.
+	//  - gateway-pod state (formerly routingExternalPodGWs) lives in
+	//    DefaultNetworkController.gatewayPodIndex; UDN controllers do
+	//    not have gateway pods.
+	// The applied OVN-state snapshot is on
+	// DefaultNetworkController.nsAppliedGWState. See
+	// namespace-migration-plan.md Phase 1b.6/1b.7.
 
 	multicastEnabled bool
 
@@ -71,24 +64,43 @@ func (bnc *BaseNetworkController) shouldWatchNamespaces() bool {
 		bnc.IsUserDefinedNetwork() && util.IsMultiNetworkPoliciesSupportEnabled()
 }
 
-// WatchNamespaces starts the watching of namespace resource and calls
-// back the appropriate handler logic
+// WatchNamespaces is the test-only entry point that routes through the
+// shared NamespaceController via the controller's nsHandlerSelf
+// back-reference. Production paths call registerNamespaceReconciler
+// directly from each controller's run(). Idempotent —
+// bnc.namespacesRegistered serves as the registered-already sentinel.
+// A future cleanup that migrates the ~99 pkg/ovn test callsites onto
+// the new path can drop this method and the back-reference together.
+//
+// Tests historically expected per-namespace setup to complete before
+// WatchNamespaces returned (the legacy retry framework's processExisting
+// callback fired AddFunc events synchronously enough that dependent
+// controllers' Start() saw fully-set-up port groups, etc.). Restore that
+// contract by waiting for the bootstrap reconciles to drain after
+// registration; without this, fast-following Start() calls in tests
+// race against the namespace controller's worker queue.
 func (bnc *BaseNetworkController) WatchNamespaces() error {
 	if !bnc.shouldWatchNamespaces() {
 		klog.Infof("Ignoring namespaces events for network: %s", bnc.GetNetworkName())
 		return nil
 	}
-
-	if bnc.namespaceHandler != nil {
+	if bnc.namespacesRegistered {
 		return nil
 	}
-
-	handler, err := bnc.retryNamespaces.WatchResource()
-	if err != nil {
+	if bnc.nsReconciler == nil || bnc.nsHandlerSelf == nil {
+		return nil
+	}
+	if err := bnc.nsReconciler.Start(); err != nil {
 		return err
 	}
-	bnc.namespaceHandler = handler
-	return err
+	if err := bnc.nsReconciler.RegisterNetworkController(bnc.nsHandlerSelf); err != nil {
+		return err
+	}
+	if err := bnc.nsReconciler.WaitForBootstrap(bnc.GetNetworkName(), 30*time.Second); err != nil {
+		return fmt.Errorf("WatchNamespaces: bootstrap drain failed: %w", err)
+	}
+	bnc.namespacesRegistered = true
+	return nil
 }
 
 // aclLoggingUpdateNsInfo parses the provided annotation values and sets nsInfo.aclLogging.Deny and
@@ -237,10 +249,7 @@ func (bnc *BaseNetworkController) ensureNamespaceLockedCommon(ns string, readOnl
 	nsInfoExisted := false
 	if nsInfo == nil {
 		nsInfo = &namespaceInfo{
-			relatedNetworkPolicies: map[string]bool{},
-			multicastEnabled:       false,
-			routingExternalPodGWs:  make(map[string]gatewayInfo),
-			routingExternalGWs:     gatewayInfo{gws: sets.New[string](), bfdEnabled: false},
+			multicastEnabled: false,
 		}
 		// we are creating nsInfo and going to set it in namespaces map
 		// so safe to hold the lock while we create and add it
@@ -330,20 +339,6 @@ func (bnc *BaseNetworkController) configureNamespaceCommon(nsInfo *namespaceInfo
 		return fmt.Errorf("failed to update multicast (%v)", err)
 	}
 	return nil
-}
-
-// GetNamespaceACLLogging retrieves ACLLoggingLevels for the Namespace.
-// nsInfo will be locked (and unlocked at the end) for given namespace if it exists.
-func (bnc *BaseNetworkController) GetNamespaceACLLogging(ns string) *libovsdbutil.ACLLoggingLevels {
-	nsInfo, nsUnlock := bnc.getNamespaceLocked(ns, true)
-	if nsInfo == nil {
-		return &libovsdbutil.ACLLoggingLevels{
-			Allow: "",
-			Deny:  "",
-		}
-	}
-	defer nsUnlock()
-	return &nsInfo.aclLogging
 }
 
 func (bnc *BaseNetworkController) updateNamespaceAclLogging(ns, aclAnnotation string, nsInfo *namespaceInfo) error {

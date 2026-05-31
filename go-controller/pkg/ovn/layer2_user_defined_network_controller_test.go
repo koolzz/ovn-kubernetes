@@ -538,6 +538,7 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 				fakeOvn.addressSetManager,
 				nil,
 				nil,
+				nil,
 			)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(dummyController.Cleanup()).To(Succeed())
@@ -634,10 +635,14 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(addrSets).To(BeEmpty(), "address set should be deleted from NB DB after cleanup")
 
-			// Recreate: new controller for the same network. NewMutableNetInfo
-			// produces a NetInfo without the tunnel keys that the network
-			// manager normally assigns; seed two keys so the L2 transit-router
-			// validation in init() succeeds.
+			// Recreate: new controller for the same network. The existing
+			// l2Controller's namespace handler registration was released
+			// by Cleanup() above (DeregisterNamespaceHandler), so the new
+			// controller can register against the same network name.
+			//
+			// NewMutableNetInfo produces a NetInfo without the tunnel keys
+			// that the network manager normally assigns; seed two keys so
+			// the L2 transit-router validation in init() succeeds.
 			mutableNetInfo.SetTunnelKeys([]int{1, 2})
 			l2ControllerNew, err := NewLayer2UserDefinedNetworkController(
 				&l2Controller.CommonNetworkControllerInfo,
@@ -649,6 +654,7 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 				fakeOvn.addressSetManager,
 				nil,
 				fakeOvn.controller.ServiceController(),
+				fakeOvn.controller.nsReconciler,
 			)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(l2ControllerNew.init()).To(Succeed())
