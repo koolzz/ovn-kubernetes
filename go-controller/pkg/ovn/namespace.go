@@ -209,6 +209,26 @@ func (oc *DefaultNetworkController) updateNamespace(old, newer *corev1.Namespace
 func (oc *DefaultNetworkController) deleteNamespace(ns *corev1.Namespace) error {
 	klog.Infof("[%s] deleting namespace", ns.Name)
 
+	// Gateway-route teardown runs FIRST, before deleteNamespaceLocked
+	// removes nsInfo from bnc.namespaces. It is retryable and needs
+	// neither nsInfo nor the namespace lock: computeDesiredGWStateForNamespace
+	// reads the (now-absent) namespace from the informer, returns empty
+	// desired state (it does NOT merge the gateway-pod index for a
+	// missing namespace — a deleted namespace has no pods to route, so
+	// a straggler gateway pod still targeting this name must not keep
+	// desired non-empty), the diff produces a full delete delta, and
+	// the snapshot is cleared on success.
+	//
+	// Ordering matters: if this ran AFTER deleteNamespaceLocked, a
+	// retryable failure here would return an error, but the retry's
+	// deleteNamespaceLocked would find nsInfo already gone, return
+	// (nil, nil), and the nsInfo==nil branch below would report
+	// success WITHOUT re-running the gateway teardown — leaking a
+	// stale snapshot and skipping the side-effect retry.
+	if err := oc.reconcileGWStateForNamespace(ns.Name); err != nil {
+		return fmt.Errorf("failed to apply gateway state teardown for namespace %s: %v", ns.Name, err)
+	}
+
 	nsInfo, err := oc.deleteNamespaceLocked(ns.Name)
 	if err != nil {
 		return err
@@ -218,15 +238,6 @@ func (oc *DefaultNetworkController) deleteNamespace(ns *corev1.Namespace) error 
 	}
 	defer nsInfo.Unlock()
 
-	// Drive the gateway-route teardown through the apply primitive:
-	// the namespace is gone from the informer so desired state is
-	// empty (modulo any active gateway-pod IPs in the index, which
-	// would still target this name), the diff against the applied
-	// snapshot produces the right delete delta, and the snapshot is
-	// cleared on success.
-	if err := oc.reconcileGWStateForNamespace(ns.Name); err != nil {
-		return fmt.Errorf("failed to apply gateway state teardown for namespace %s: %v", ns.Name, err)
-	}
 	if err := oc.multicastDeleteNamespace(ns, nsInfo); err != nil {
 		return fmt.Errorf("failed to delete multicast namespace error %v", err)
 	}

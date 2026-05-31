@@ -66,6 +66,15 @@ func (oc *DefaultNetworkController) reconcileGWStateForNamespace(ns string) erro
 //     conntrack deletes. Cheap when the gateway-IP set is stable
 //     (nothing matches the wrong-criteria predicate) but not free;
 //     this is an explicit "always reconcile conntrack" decision.
+//
+// Error handling: a non-nil return from sideEffects is RETRYABLE (e.g.
+// the multi-zone APB gateway-IP lookup failed before any conntrack
+// flush ran). We propagate it and do NOT advance the snapshot, so the
+// workqueue retries the whole reconcile; the route delta re-applies
+// idempotently and side effects run again. Genuinely best-effort
+// failures (the annotation patch and the conntrack flush itself) are
+// swallowed inside applyGWStateSideEffects and never surface here, so
+// they don't trigger retries.
 func runGWReconcile(
 	ns string,
 	applied, desired *desiredGWState,
@@ -80,7 +89,7 @@ func runGWReconcile(
 		}
 	}
 	if err := sideEffects(ns, desired); err != nil {
-		klog.Errorf("Gateway-state side effects for namespace %s failed: %v", ns, err)
+		return fmt.Errorf("gateway-state side effects for namespace %s: %w", ns, err)
 	}
 	if desired.size() == 0 {
 		snapshot.Delete(ns)
@@ -135,18 +144,28 @@ func (oc *DefaultNetworkController) applyGWStateSideEffects(ns string, desired *
 
 // computeDesiredGWStateForNamespace builds the per-namespace desired
 // gateway state by merging the annotation-derived and pod-derived
-// sources. A namespace that's gone from the informer (deletion in
-// flight) has no annotation contribution; the gateway-pod index still
-// contributes if any active gateway pod is targeting the name.
+// sources.
+//
+// A namespace that's gone from the informer has EMPTY desired state —
+// it has no pods, so no external-gateway routes are desired for it,
+// regardless of any gateway pod whose stale routing-namespaces
+// annotation still targets this name. Crucially we do NOT merge the
+// gateway-pod index in this case: if we did, a surviving gateway pod
+// targeting the deleted namespace would keep desired non-empty, the
+// diff against the applied snapshot would be empty, and the
+// namespace-scoped route teardown would never run (the snapshot and
+// any straggler routes would leak). Returning empty makes the diff a
+// full teardown, matching the pre-migration deleteGWRoutesForNamespace(ns, nil)
+// sweep on namespace delete.
 func (oc *DefaultNetworkController) computeDesiredGWStateForNamespace(ns string) (*desiredGWState, error) {
 	nsObj, err := oc.watchFactory.GetNamespace(ns)
 	if err != nil && !apierrors.IsNotFound(err) {
 		return nil, err
 	}
-	var annotation gatewayInfo
-	if nsObj != nil {
-		annotation = parseAnnotationGWs(nsObj)
+	if nsObj == nil {
+		return newDesiredGWState(), nil
 	}
+	annotation := parseAnnotationGWs(nsObj)
 	var podGWs map[string]bool
 	if oc.gatewayPodIndex != nil {
 		podGWs = oc.gatewayPodIndex.GatewaysForNamespace(ns)

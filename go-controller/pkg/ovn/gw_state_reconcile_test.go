@@ -384,3 +384,31 @@ func TestRunGWReconcile_DeltaErrorShortCircuits(t *testing.T) {
 		t.Error("snapshot must NOT be updated on delta error")
 	}
 }
+
+func TestRunGWReconcile_SideEffectErrorRetriesWithoutAdvancingSnapshot(t *testing.T) {
+	// A retryable side-effect error (e.g. the multi-zone APB
+	// gateway-IP lookup failing before any conntrack flush) must
+	// propagate so the workqueue retries, and must NOT advance the
+	// applied snapshot — otherwise the side effect is skipped
+	// permanently with no retry. Best-effort failures (annotation
+	// patch, conntrack flush) are swallowed inside
+	// applyGWStateSideEffects and never reach runGWReconcile, so they
+	// don't trigger this path.
+	progr := &fakeGWRouteProgrammer{}
+	snapshot := newNSAppliedGWState()
+	desired := newDesiredGWState()
+	desired.addGW("10.0.0.1", false)
+	applied := newDesiredGWState()
+	applied.addGW("10.0.0.1", false) // identical → empty delta, side effects still run
+
+	wantErr := errors.New("APB gateway-IP lookup failed")
+	sideEffects := func(ns string, d *desiredGWState) error { return wantErr }
+
+	err := runGWReconcile("ns-target", applied, desired, progr, sideEffects, snapshot)
+	if err == nil || !errors.Is(err, wantErr) {
+		t.Fatalf("expected wrapped side-effect error, got %v", err)
+	}
+	if snapshot.Get("ns-target") != nil {
+		t.Error("snapshot must NOT advance when side effects return a retryable error")
+	}
+}
