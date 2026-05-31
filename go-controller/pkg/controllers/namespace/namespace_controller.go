@@ -101,12 +101,20 @@ type NamespaceController struct {
 	// stateMu protects nsReconciliation, bootstrapPending, nsActive,
 	// nsNetworks, nsCache, and latestInformerNsCache.
 	stateMu sync.RWMutex
-	// nsReconciliation tracks namespaces that should be treated as
-	// "new" per network. The bool is true when the next reconcile
-	// should be a delete pass (mirrors NodeController.nodeReconciliation).
-	// Entries are cleared on SUCCESSFUL reconcile.
+	// nsReconciliation tracks namespaces that should be treated as a
+	// fresh add for a network on their next reconcile (the gate nulls
+	// oldNS when an entry is present). Populated by bootstrapNetwork;
+	// cleared on a SUCCESSFUL reconcile.
+	//
+	// Unlike NodeController.nodeReconciliation, there is no delete-pending
+	// dimension: NodeController eagerly clears active state before its
+	// delete handler runs and needs a persistent mark to re-drive a
+	// failed delete on retry. Here deleteNamespaceActive runs only AFTER
+	// the handler delete succeeds (see reconcileDelete), so the cached
+	// "had" state survives a failed delete and the (had && !has) branch
+	// re-drives the retry on its own — no mark needed.
 	// keyed by network -> namespaces
-	nsReconciliation map[string]map[string]bool
+	nsReconciliation map[string]map[string]struct{}
 	// bootstrapPending tracks namespaces enqueued by bootstrapNetwork
 	// that haven't yet had their FIRST reconcile attempt complete (for
 	// any outcome, success or error). WaitForBootstrap watches this
@@ -151,7 +159,7 @@ func NewController(wf *factory.WatchFactory, name string, networkManager network
 		networkManager:        networkManager,
 		nsLister:              nsInformer.Lister(),
 		handlers:              syncmap.NewSyncMap[NamespaceHandler](),
-		nsReconciliation:      map[string]map[string]bool{},
+		nsReconciliation:      map[string]map[string]struct{}{},
 		bootstrapPending:      map[string]map[string]struct{}{},
 		nsActive:              map[string]map[string]struct{}{},
 		nsNetworks:            map[string]map[string]struct{}{},
@@ -426,11 +434,9 @@ func (c *NamespaceController) reconcileNamespace(key string) error {
 		}
 
 		// Fall through: had && has, or force-add from case 3 above.
-		// The namespaceNeedsReconciliation read preserves the
-		// external Mark* signal (still used by
-		// base_network_controller.doReconcile) that requests a
-		// fresh-add reapply for an already-active namespace. Drop
-		// once external callers are gone.
+		// A bootstrap namespace (seeded into nsReconciliation by
+		// bootstrapNetwork) is treated as a fresh add even if it
+		// raced an informer event that already marked it active.
 		if c.namespaceNeedsReconciliation(netName, nsName) {
 			oldNS = nil
 		}
@@ -472,7 +478,6 @@ func (c *NamespaceController) reconcileDelete(handler NamespaceHandler, nsName, 
 	}
 
 	c.deleteNamespaceActive(netName, nsName)
-	c.clearNamespaceDeleteReconciliation(netName, nsName)
 	c.deleteCachedNamespace(netName, nsName)
 	c.deleteLatestInformerNamespace(netName, nsName)
 
@@ -516,10 +521,10 @@ func (c *NamespaceController) setBootstrapNamespaces(netName string, nss []*core
 	if len(nss) == 0 {
 		return
 	}
-	recon := make(map[string]bool, len(nss))
+	recon := make(map[string]struct{}, len(nss))
 	pending := make(map[string]struct{}, len(nss))
 	for _, ns := range nss {
-		recon[ns.Name] = false
+		recon[ns.Name] = struct{}{}
 		pending[ns.Name] = struct{}{}
 	}
 	c.nsReconciliation[netName] = recon
@@ -555,31 +560,6 @@ func (c *NamespaceController) namespaceNeedsReconciliation(netName, nsName strin
 	return ok
 }
 
-func (c *NamespaceController) namespaceNeedsDeleteReconciliation(netName, nsName string) bool {
-	c.stateMu.RLock()
-	defer c.stateMu.RUnlock()
-	nss := c.nsReconciliation[netName]
-	if len(nss) == 0 {
-		return false
-	}
-	if needsDelete, ok := nss[nsName]; ok && needsDelete {
-		return true
-	}
-	return false
-}
-
-func (c *NamespaceController) clearNamespaceDeleteReconciliation(netName, nsName string) {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	nss := c.nsReconciliation[netName]
-	if len(nss) == 0 {
-		return
-	}
-	if _, ok := nss[nsName]; ok {
-		nss[nsName] = false
-	}
-}
-
 func (c *NamespaceController) deleteNamespaceReconciliation(netName, nsName string) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
@@ -591,40 +571,6 @@ func (c *NamespaceController) deleteNamespaceReconciliation(netName, nsName stri
 	if len(nss) == 0 {
 		delete(c.nsReconciliation, netName)
 	}
-}
-
-// MarkNamespaceNeedsReconciliation flags the namespace as needing a
-// reconciliation pass for the given network. Callers use this when a NAD
-// transition or similar makes a previously-unactive namespace active for
-// the network.
-func (c *NamespaceController) MarkNamespaceNeedsReconciliation(netName, nsName string) {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	nss := c.nsReconciliation[netName]
-	if nss == nil {
-		nss = map[string]bool{}
-		c.nsReconciliation[netName] = nss
-	}
-	if _, ok := nss[nsName]; ok {
-		return
-	}
-	nss[nsName] = false
-}
-
-// MarkNamespaceNeedsDeleteReconciliation flags the namespace as needing a
-// delete pass for the given network. Callers use this when a NAD
-// transition deactivates a previously-active namespace for the network.
-// The next reconcile will run handler.ReconcileNamespace with newNS=nil so
-// the handler can tear down its OVN-side state.
-func (c *NamespaceController) MarkNamespaceNeedsDeleteReconciliation(netName, nsName string) {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	nss := c.nsReconciliation[netName]
-	if nss == nil {
-		nss = map[string]bool{}
-		c.nsReconciliation[netName] = nss
-	}
-	nss[nsName] = true
 }
 
 func (c *NamespaceController) namespaceHasAnyNetwork(nsName string) bool {

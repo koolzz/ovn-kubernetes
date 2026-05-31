@@ -312,7 +312,10 @@ func (oc *BaseNetworkController) doReconcile(reconcileRoutes, reconcilePendingPo
 	// address set is created for the namespace.
 	if oc.nsReconciler != nil {
 		for _, ns := range reconcileNamespaces {
-			oc.nsReconciler.MarkNamespaceNeedsReconciliation(oc.GetNetworkName(), ns)
+			// The shared controller's (had, has) gate derives the
+			// right leg (fresh-add for newly-claimed, delete for
+			// no-longer-claimed) from cached state on its own, so a
+			// plain enqueue is sufficient — no explicit mark needed.
 			oc.nsReconciler.ReconcileNetwork(ns, oc.GetNetworkName())
 		}
 	}
@@ -374,12 +377,14 @@ func (oc *BaseNetworkController) ReconcilePod(podKey string) error {
 //
 // Synchronous bootstrap contract: RegisterNetworkController only
 // SyncNamespaces + enqueues per-namespace reconciles; it does NOT
-// wait for the workqueue to drain. Dependent watchers (NetworkPolicy,
-// Pods) MUST see a fully-applied namespace cache before they start —
-// otherwise a NetworkPolicy add can race the namespace's
-// AddNamespace, miss the port group, fail to attach, and stay
-// unenforced until retry. Block here on WaitForBootstrap to preserve
-// the legacy WatchNamespaces ordering contract.
+// wait for the workqueue to drain. Block here on WaitForBootstrap so
+// dependent watchers (NetworkPolicy, Pods) start only after every
+// existing namespace has been PROCESSED ONCE (first reconcile
+// attempt completed — not necessarily applied successfully; a failed
+// namespace stays in the workqueue retry path). This preserves the
+// legacy WatchNamespaces ordering contract: a NetworkPolicy add
+// shouldn't race a namespace's first AddNamespace, miss the port
+// group, and stay unenforced until retry.
 func (oc *BaseNetworkController) registerNamespaceReconciler(handler nscontroller.NamespaceHandler) error {
 	if !oc.shouldWatchNamespaces() {
 		klog.Infof("Ignoring namespaces events for network: %s", oc.GetNetworkName())

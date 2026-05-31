@@ -89,7 +89,7 @@ func newTestController(t *testing.T) *NamespaceController {
 		networkManager:        networkmanager.Default().Interface(),
 		nsLister:              newNamespaceLister(t),
 		handlers:              syncmap.NewSyncMap[NamespaceHandler](),
-		nsReconciliation:      map[string]map[string]bool{},
+		nsReconciliation:      map[string]map[string]struct{}{},
 		bootstrapPending:      map[string]map[string]struct{}{},
 		nsActive:              map[string]map[string]struct{}{},
 		nsNetworks:            map[string]map[string]struct{}{},
@@ -192,7 +192,7 @@ func TestWaitForBootstrap_DrainsOnHandlerError(t *testing.T) {
 		t.Fatalf("bootstrap should drain after one attempt even on handler error; got %v", err)
 	}
 
-	// nsReconciliation entry persists (still needs the Mark*
+	// nsReconciliation entry persists (still needs the bootstrap
 	// fresh-add semantic on the next retry) — only bootstrapPending
 	// gets cleared by the attempt.
 	c.stateMu.RLock()
@@ -338,24 +338,26 @@ func TestRegisterIsNilSafe(t *testing.T) {
 	}
 }
 
-func TestMarkNamespaceNeedsReconciliationFlags(t *testing.T) {
+func TestBootstrapNamespacesAreTreatedAsFreshAdd(t *testing.T) {
+	// setBootstrapNamespaces seeds nsReconciliation so the gate's
+	// fall-through nulls oldNS (fresh-add semantics) for namespaces
+	// enqueued by bootstrap. A successful reconcile clears the entry.
 	c := newTestController(t)
+	nsA := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns1"}}
+	c.setBootstrapNamespaces("net-a", []*corev1.Namespace{nsA})
 
-	// Activity-flip: namespace becomes active, then the next reconcile
-	// should treat it as new (not delete).
-	c.MarkNamespaceNeedsReconciliation("net-a", "ns1")
 	if !c.namespaceNeedsReconciliation("net-a", "ns1") {
-		t.Fatalf("expected ns1 to be marked needsReconciliation for net-a")
+		t.Fatalf("bootstrap namespace ns1 should be flagged for fresh-add reconciliation")
 	}
-	if c.namespaceNeedsDeleteReconciliation("net-a", "ns1") {
-		t.Fatalf("ns1 must not be marked needsDelete after MarkNeedsReconciliation")
+	// A namespace not seeded by bootstrap is not flagged.
+	if c.namespaceNeedsReconciliation("net-a", "other") {
+		t.Fatalf("non-bootstrap namespace must not be flagged")
 	}
-
-	// Activity-flip in the other direction: namespace becomes inactive,
-	// next reconcile should run delete.
-	c.MarkNamespaceNeedsDeleteReconciliation("net-a", "ns2")
-	if !c.namespaceNeedsDeleteReconciliation("net-a", "ns2") {
-		t.Fatalf("expected ns2 to be marked needsDelete for net-a")
+	// Clearing (what reconcileUpdate/reconcileDelete do on success)
+	// removes the flag.
+	c.deleteNamespaceReconciliation("net-a", "ns1")
+	if c.namespaceNeedsReconciliation("net-a", "ns1") {
+		t.Fatalf("flag must be cleared after deleteNamespaceReconciliation")
 	}
 }
 

@@ -726,9 +726,11 @@ func (oc *DefaultNetworkController) run(_ context.Context) error {
 	// runs SyncNamespaces, enqueues per-ns reconciles, AND blocks on
 	// WaitForBootstrap so the legacy WatchNamespaces ordering contract
 	// holds — node startup, WatchPods, and WatchNetworkPolicy below all
-	// see a fully-applied namespace cache before they start. Without
-	// the drain, a NetworkPolicy add could race the namespace's
-	// AddNamespace, miss the port group, and stay unenforced.
+	// start only after every existing namespace has been processed once
+	// (first reconcile attempt completed; failures left to normal
+	// retry). Without the drain, a NetworkPolicy add could race the
+	// namespace's first AddNamespace, miss the port group, and stay
+	// unenforced.
 	if err := WithSyncDurationMetric("namespace", func() error {
 		return oc.registerNamespaceReconciler(oc)
 	}); err != nil {
