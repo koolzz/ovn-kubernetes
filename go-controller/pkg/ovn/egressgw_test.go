@@ -3788,3 +3788,104 @@ func assertElementsMatch(t *testing.T, want, got []string) {
 		t.Fatalf("set mismatch:\n  want: %v\n   got: %v", want, got)
 	}
 }
+
+var _ = ginkgo.Describe("Gateway static route BFD column flip", func() {
+	const (
+		gw            = "9.0.0.1"
+		podIP         = "10.128.1.3"
+		namespaceName = "namespace1"
+	)
+	var (
+		app     *cli.App
+		fakeOvn *FakeOVN
+	)
+
+	ginkgo.BeforeEach(func() {
+		gomega.Expect(config.PrepareTestConfig()).To(gomega.Succeed())
+		config.OVNKubernetesFeature.EnableMultiExternalGateway = true
+		app = cli.NewApp()
+		app.Name = "test"
+		app.Flags = config.Flags
+		fakeOvn = NewFakeOVN(true)
+	})
+
+	ginkgo.AfterEach(func() {
+		fakeOvn.shutdown()
+	})
+
+	// Regression test for namespace-gateway-migration-resume.md fix #3:
+	// toggling k8s.ovn.org/bfd-enabled on a namespace whose external
+	// gateway IP is unchanged produces a "replace" delta, which must
+	// flip the route's BFD column. The old delete+create-in-one-txn left
+	// the column stuck (the create matched the still-cached pre-delete
+	// route and emitted a BFD-untouched update). This drives the full
+	// reconcile path (updateNamespace -> reconcileGWStateForNamespace ->
+	// applyBFDReplaceAtomicallyForNamespace) and so also covers fix #1's
+	// unconditional reconcile.
+	ginkgo.It("flips the route BFD column false->true->false on a bfd-enabled namespace annotation toggle", func() {
+		app.Action = func(*cli.Context) error {
+			namespaceT := *ovntest.NewNamespace(namespaceName)
+			namespaceT.Annotations = map[string]string{"k8s.ovn.org/routing-external-gws": gw}
+			t := newTPod(
+				"node1",
+				"10.128.1.0/24",
+				"10.128.1.2",
+				"10.128.1.1",
+				"myPod",
+				podIP,
+				"0a:58:0a:80:01:03",
+				namespaceT.Name,
+			)
+
+			fakeOvn.startWithDBSetup(
+				libovsdbtest.TestSetup{
+					NBData: []libovsdbtest.TestData{
+						&nbdb.LogicalSwitch{UUID: "node1", Name: "node1"},
+						&nbdb.LogicalRouter{UUID: "GR_node1-UUID", Name: "GR_node1"},
+					},
+				},
+				&corev1.NamespaceList{Items: []corev1.Namespace{namespaceT}},
+				&corev1.NodeList{Items: []corev1.Node{*newNode("node1", "192.168.126.202/24")}},
+				&corev1.PodList{Items: []corev1.Pod{*ovntest.NewPod(t.namespace, t.podName, t.nodeName, t.podIP)}},
+			)
+			t.populateLogicalSwitchCache(fakeOvn)
+			injectNode(fakeOvn)
+			gomega.Expect(fakeOvn.controller.WatchNamespaces()).To(gomega.Succeed())
+			gomega.Expect(fakeOvn.controller.WatchPods()).To(gomega.Succeed())
+
+			mask := util.GetIPFullMaskString(podIP)
+			routeBFDSet := func() (bool, error) {
+				routes, err := libovsdbops.FindLogicalRouterStaticRoutesWithPredicate(fakeOvn.nbClient,
+					func(r *nbdb.LogicalRouterStaticRoute) bool {
+						return r.IPPrefix == podIP+mask && r.Nexthop == gw
+					})
+				if err != nil {
+					return false, err
+				}
+				if len(routes) != 1 {
+					return false, fmt.Errorf("expected exactly 1 matching route, got %d", len(routes))
+				}
+				return routes[0].BFD != nil, nil
+			}
+
+			// Baseline: gateway route present, BFD disabled.
+			gomega.Eventually(routeBFDSet, 2).Should(gomega.BeFalse(), "BFD column should start unset")
+
+			// false->true: add the bfd-enabled annotation.
+			nsBFD := namespaceT.DeepCopy()
+			nsBFD.Annotations["k8s.ovn.org/bfd-enabled"] = ""
+			_, err := fakeOvn.fakeClient.KubeClient.CoreV1().Namespaces().Update(context.Background(), nsBFD, metav1.UpdateOptions{})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Eventually(routeBFDSet, 5).Should(gomega.BeTrue(), "BFD column should be set after enabling bfd")
+
+			// true->false: remove the bfd-enabled annotation.
+			nsNoBFD := nsBFD.DeepCopy()
+			delete(nsNoBFD.Annotations, "k8s.ovn.org/bfd-enabled")
+			_, err = fakeOvn.fakeClient.KubeClient.CoreV1().Namespaces().Update(context.Background(), nsNoBFD, metav1.UpdateOptions{})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Eventually(routeBFDSet, 5).Should(gomega.BeFalse(), "BFD column should be cleared after disabling bfd")
+			return nil
+		}
+		gomega.Expect(app.Run([]string{app.Name})).To(gomega.Succeed())
+	})
+})

@@ -34,12 +34,20 @@ import (
 // reconcile to re-converge and the side-effect retry to fire on that
 // pass.
 func (oc *DefaultNetworkController) reconcileGWStateForNamespace(ns string) error {
-	desired, err := oc.computeDesiredGWStateForNamespace(ns)
-	if err != nil {
-		return err
-	}
-	applied := oc.nsAppliedGWState.Get(ns)
-	return runGWReconcile(ns, applied, desired, oc, oc.applyGWStateSideEffects, oc.nsAppliedGWState)
+	// Serialize the whole read-apply-write per namespace so the inline
+	// pod-path call and the namespace-worker call cannot interleave their
+	// snapshot Get/Set and clobber each other. desired is recomputed from
+	// the authoritative current state (annotation + gatewayPodIndex)
+	// inside the lock, so the last writer converges to the correct state
+	// rather than to a stale delta. See gwReconcileLocks.
+	return oc.gwReconcileLocks.DoWithLock(ns, func(ns string) error {
+		desired, err := oc.computeDesiredGWStateForNamespace(ns)
+		if err != nil {
+			return err
+		}
+		applied := oc.nsAppliedGWState.Get(ns)
+		return runGWReconcile(ns, applied, desired, oc, oc.applyGWStateSideEffects, oc.nsAppliedGWState)
+	})
 }
 
 // runGWReconcile is the orchestration core of reconcileGWStateForNamespace.
@@ -221,12 +229,20 @@ func (oc *DefaultNetworkController) deleteRoutesForNamespace(ns string, matchGWs
 }
 
 // applyBFDReplaceAtomicallyForNamespace replaces gateway-pod static
-// routes whose BFD flag is changing, per affected pod, in one libovsdb
-// transaction per pod. Per-pod atomicity ensures no pod briefly loses
-// its route to a replace-target gateway IP while the BFD setting
-// transitions — the previous "delete pass + add pass" sequence in
-// applyGWStateDelta exposed a bounded no-route window between the two
-// transactions.
+// routes whose BFD flag is changing. A BFD replace is a same-IP toggle:
+// the route already exists and only its BFD column changes. Per affected
+// pod it runs TWO transactions — delete the old routes, then build and
+// create them afresh with the new BFD setting. The create ops are built
+// ONLY AFTER the delete transaction commits, so the libovsdb cache no
+// longer holds the old route and the create is a fresh INSERT (with the
+// correct BFD column on enable, absent on disable) rather than an in-place
+// update of the about-to-be-deleted route. Building the create ops before
+// the delete committed would make correctness depend on the route
+// predicate failing to match (it currently matches Policy by pointer);
+// and an in-place column update instead would leave cleanUpBFDEntry
+// reading a stale cache and leaking the orphan BFD row. The delete+insert
+// route-identity change is the same shape cleanUpBFDEntry already expects.
+// See namespace-gateway-migration-resume.md fix #3.
 //
 // APB-managed gateway IPs are skipped; their routes are owned by the
 // apbroute controller. After each per-pod transaction we sweep
@@ -270,7 +286,14 @@ func (oc *DefaultNetworkController) applyBFDReplaceAtomicallyForNamespace(ns str
 	seenSweep := map[bfdSweep]struct{}{}
 
 	if err := oc.externalGatewayRouteInfo.CleanupNamespace(ns, func(routeInfo *apbroutecontroller.RouteInfo) error {
-		var ops []ovsdb.Operation
+		// replaceTarget carries the per-route params so the create ops
+		// can be (re)built AFTER the delete transaction commits.
+		type replaceTarget struct {
+			newBFD                    bool
+			gw, podIP, gr, port, mask string
+		}
+		var targets []replaceTarget
+		var delOps []ovsdb.Operation
 		for podIP, routes := range routeInfo.PodExternalRoutes {
 			for gw, gr := range routes {
 				newBFD, ok := targetBFD[gw]
@@ -284,14 +307,11 @@ func (oc *DefaultNetworkController) applyBFDReplaceAtomicallyForNamespace(ns str
 					return fmt.Errorf("failed extSwitchPrefix for gr %s: %w", gr, err)
 				}
 				port := portPrefix + types.GWRouterToExtSwitchPrefix + gr
-				ops, err = oc.deleteLogicalRouterStaticRouteOps(ops, podIP, mask, gw, gr)
+				delOps, err = oc.deleteLogicalRouterStaticRouteOps(delOps, podIP, mask, gw, gr)
 				if err != nil {
 					return err
 				}
-				ops, err = oc.createBFDStaticRouteOps(ops, newBFD, gw, podIP, gr, port, mask)
-				if err != nil {
-					return err
-				}
+				targets = append(targets, replaceTarget{newBFD: newBFD, gw: gw, podIP: podIP, gr: gr, port: port, mask: mask})
 				sw := bfdSweep{gw: gw, gr: gr, portPrefix: portPrefix}
 				if _, dup := seenSweep[sw]; !dup {
 					seenSweep[sw] = struct{}{}
@@ -299,11 +319,24 @@ func (oc *DefaultNetworkController) applyBFDReplaceAtomicallyForNamespace(ns str
 				}
 			}
 		}
-		if len(ops) == 0 {
+		if len(targets) == 0 {
 			return nil
 		}
-		if _, err := libovsdbops.TransactAndCheck(oc.nbClient, ops); err != nil {
-			return fmt.Errorf("failed atomic BFD-replace transaction for pod %s: %w", routeInfo.PodName, err)
+		// Commit the delete first; only then build the create ops, so
+		// they insert fresh routes against the post-delete cache.
+		if _, err := libovsdbops.TransactAndCheck(oc.nbClient, delOps); err != nil {
+			return fmt.Errorf("failed BFD-replace delete transaction for pod %s: %w", routeInfo.PodName, err)
+		}
+		var addOps []ovsdb.Operation
+		for _, t := range targets {
+			var err error
+			addOps, err = oc.createBFDStaticRouteOps(addOps, t.newBFD, t.gw, t.podIP, t.gr, t.port, t.mask)
+			if err != nil {
+				return err
+			}
+		}
+		if _, err := libovsdbops.TransactAndCheck(oc.nbClient, addOps); err != nil {
+			return fmt.Errorf("failed BFD-replace create transaction for pod %s: %w", routeInfo.PodName, err)
 		}
 		return nil
 	}); err != nil {

@@ -158,6 +158,17 @@ type DefaultNetworkController struct {
 	// static routes and reconstructs the snapshot per-namespace so the
 	// first reconcile after a restart sees the real applied state.
 	nsAppliedGWState *nsAppliedGWState
+
+	// gwReconcileLocks serializes reconcileGWStateForNamespace per
+	// namespace. The apply primitive is a read-apply-write against
+	// nsAppliedGWState (compute desired → Get applied → apply delta →
+	// Set applied); without a per-namespace lock the inline pod-path
+	// call (add/deletePodExternalGW) and the namespace-worker call can
+	// interleave their Get/Set and clobber each other's snapshot,
+	// diverging it from OVN. Master serialized these on the per-nsInfo
+	// lock; this restores that guarantee without reintroducing the
+	// nsInfo lock. See namespace-gateway-migration-resume.md fix #2.
+	gwReconcileLocks *syncmap.SyncMap[struct{}]
 }
 
 // NewDefaultNetworkController creates a new OVN controller for creating logical network
@@ -270,6 +281,7 @@ func newDefaultNetworkControllerCommon(
 		gatewayTopologyFactory:     topology.NewGatewayTopologyFactory(cnci.nbClient),
 		gatewayPodIndex:            newGatewayPodIndex(),
 		nsAppliedGWState:           newNSAppliedGWState(),
+		gwReconcileLocks:           syncmap.NewSyncMap[struct{}](),
 	}
 	// Back-reference for the legacy WatchNamespaces test entry point;
 	// production paths register through the shared NamespaceController

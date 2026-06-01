@@ -14,6 +14,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	ktypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
@@ -306,19 +307,39 @@ func (oc *DefaultNetworkController) addLogicalPort(pod *corev1.Pod) (err error) 
 	}
 	ops = append(ops, addOps...)
 
-	// if we have any external or pod Gateways, add routes
-	gateways := make([]*gatewayInfo, 0, len(routingExternalGWs.gws)+len(routingPodGWs))
-
-	if len(routingExternalGWs.gws) > 0 {
-		gateways = append(gateways, routingExternalGWs)
+	// Merge every gateway source (namespace annotation + each gateway
+	// pod) by IP with OR-on-collision BFD — the same shape
+	// computeDesiredGWStateForNamespace produces — so a newly added pod
+	// programs the same per-IP BFD flag the namespace reconcile would.
+	// Passing the raw per-source gatewayInfos instead would let whichever
+	// source is processed first win the BFD flag for a shared IP
+	// (addGWRoutesForPod skips an IP whose route already exists), and
+	// since pod-add fires no namespace event nothing would repair the
+	// mismatch afterward.
+	merged := newDesiredGWState()
+	if routingExternalGWs != nil {
+		merged.addAnnotationGWs(*routingExternalGWs)
 	}
 	for key := range routingPodGWs {
-		gw := routingPodGWs[key]
-		if len(gw.gws) > 0 {
-			gateways = append(gateways, &gw)
+		merged.addAnnotationGWs(routingPodGWs[key])
+	}
+	// Group the merged (IP -> BFD) map into at most two gatewayInfos, one
+	// per BFD setting, so each IP is programmed exactly once with its
+	// OR-merged flag.
+	bfdGWs, noBFDGWs := sets.New[string](), sets.New[string]()
+	for ip, bfd := range merged.gws {
+		if bfd {
+			bfdGWs.Insert(ip)
 		} else {
-			klog.Warningf("Found routingPodGW with no gateways ip set for namespace %s", pod.Namespace)
+			noBFDGWs.Insert(ip)
 		}
+	}
+	gateways := make([]*gatewayInfo, 0, 2)
+	if bfdGWs.Len() > 0 {
+		gateways = append(gateways, &gatewayInfo{gws: bfdGWs, bfdEnabled: true})
+	}
+	if noBFDGWs.Len() > 0 {
+		gateways = append(gateways, &gatewayInfo{gws: noBFDGWs, bfdEnabled: false})
 	}
 
 	if len(gateways) > 0 {

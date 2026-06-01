@@ -124,31 +124,44 @@ func (oc *DefaultNetworkController) updateNamespace(old, newer *corev1.Namespace
 	_, newBFDEnabled := newer.Annotations[util.BfdAnnotation]
 	_, oldBFDEnabled := old.Annotations[util.BfdAnnotation]
 
-	if gwAnnotation != oldGWAnnotation || newBFDEnabled != oldBFDEnabled {
+	// Reconcile gateway state UNCONDITIONALLY — not gated on the
+	// annotation/BFD diff. reconcileGWStateForNamespace is idempotent
+	// (empty delta when desired == applied), so running it on every
+	// namespace update makes the namespace worker a reliable
+	// convergence/retry path for *pod-driven* gateway changes too, not
+	// just annotation-driven ones. Without this, a namespace enqueued
+	// after a gateway-pod change (or a transient pod-path apply failure)
+	// would no-op and the divergence would persist. It drives both the
+	// route deltas and the IC-mode side effects (annotation patch /
+	// conntrack flush) — see applyGWStateSideEffects.
+	// See namespace-gateway-migration-resume.md fix #1.
+	if gwAnnotation != "" {
 		// Surface a parse error to the caller; the apply primitive
-		// below consumes the parsed annotation directly off the
-		// namespace object, so no nsInfo write is required here.
-		if gwAnnotation != "" {
-			if _, err := util.ParseRoutingExternalGWAnnotation(gwAnnotation); err != nil {
-				errors = append(errors, err)
-			}
+		// consumes the parsed annotation directly off the namespace
+		// object, so no nsInfo write is required here.
+		if _, err := util.ParseRoutingExternalGWAnnotation(gwAnnotation); err != nil {
+			errors = append(errors, err)
 		}
-		// reconcileGWStateForNamespace drives both the route deltas and
-		// the IC-mode-specific side effects (annotation patch /
-		// conntrack flush) — see applyGWStateSideEffects in
-		// gw_state_reconcile.go. The "gateway-added → drop existing
-		// per-pod SNAT" cleanup that used to live here is redundant
-		// now: addGWRoutesForNamespace inside the apply primitive
-		// already calls deletePodSNAT per pod (see
-		// egressgw.go:addGWRoutesForNamespace) when DisableSNATMultipleGWs.
-		if err := oc.reconcileGWStateForNamespace(old.Name); err != nil {
-			errors = append(errors, fmt.Errorf("failed to apply gateway state for namespace %s: %v", old.Name, err))
-		}
+	}
+	if err := oc.reconcileGWStateForNamespace(old.Name); err != nil {
+		errors = append(errors, fmt.Errorf("failed to apply gateway state for namespace %s: %v", old.Name, err))
+	}
+
+	if gwAnnotation != oldGWAnnotation || newBFDEnabled != oldBFDEnabled {
 		// "Gateway-removed → restore per-pod SNAT": fan out per-pod
 		// reconcile via the level-driven ReconcilePod entry point. The
 		// pod controller's add path re-runs, sees no gateways for the
 		// namespace, and programs SNAT through its own normal flow —
 		// no inline SNAT op-construction in the namespace handler.
+		//
+		// This stays gated on the annotation/BFD transition: the
+		// gwAnnotation == "" case is true for nearly every namespace
+		// (most have no external gateways), so fanning out on every
+		// no-gateway namespace update would re-enqueue all pods in the
+		// cluster on every namespace event. Route convergence above is
+		// the unconditional path; SNAT restore only needs to fire on
+		// the gateway-removed edge.
+		//
 		// HasActiveGWPods (not PodsForNamespace) is the right gate
 		// here: inactive payloads — pods kept in the index but not
 		// ready or without resolved gateway IPs — must NOT prevent
