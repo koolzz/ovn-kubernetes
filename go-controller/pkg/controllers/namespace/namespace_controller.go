@@ -388,7 +388,18 @@ func (c *NamespaceController) reconcileNamespace(key string) error {
 			if oldNS != nil {
 				oldState = c.annotationCache.UpdateNamespaceAnnotationState(oldNS, true)
 			}
-			if had {
+			// Run the delete leg when the namespace was active (had) OR
+			// still has a pending bootstrap reconciliation. The bootstrap
+			// case matters on a fresh start: a namespace included in
+			// bootstrapNetwork's initial list that is deleted before its
+			// scoped reconcile runs has had == false (nsActive is only set
+			// after a successful add, which never happened). SyncNamespaces
+			// saw the same stale list and therefore did NOT clean up that
+			// namespace's state, so stale per-namespace OVN state from a
+			// previous run would otherwise leak. reconcileDelete is
+			// idempotent — it synthesizes a stub namespace when none is
+			// cached and runs the handler's delete leg.
+			if had || c.namespaceNeedsReconciliation(netName, nsName) {
 				if err := c.reconcileDelete(handler, nsName, netName, oldNS, oldState); err != nil {
 					return fmt.Errorf("%s: failed to delete namespace %s for network %s: %w", c.name, nsName, netName, err)
 				}
