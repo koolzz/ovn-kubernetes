@@ -4,6 +4,7 @@
 package ovn
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -950,6 +951,116 @@ var _ = ginkgo.Describe("Gateway Init Operations", func() {
 				nodeName, clusterIPSubnets, hostSubnets, l3GatewayConfig, joinLRPIPs, defLRPIPs, skipSnat, mgmtPortIP,
 				"1400")
 			gomega.Eventually(fakeOvn.nbClient).Should(libovsdbtest.HaveData(expectedDatabaseState))
+		})
+
+		ginkgo.It("clears Tag and TagRequest on the external LSP when VLAN annotation transitions from non-zero to zero", func() {
+			expectedOVNClusterRouter := &nbdb.LogicalRouter{
+				UUID:         types.OVNClusterRouter + "-UUID",
+				Name:         types.OVNClusterRouter,
+				StaticRoutes: []string{},
+			}
+			expectedNodeSwitch := &nbdb.LogicalSwitch{
+				UUID: nodeName + "-UUID",
+				Name: nodeName,
+			}
+			expectedClusterLBGroup := &nbdb.LoadBalancerGroup{
+				UUID: types.ClusterLBGroupName + "-UUID",
+				Name: types.ClusterLBGroupName,
+			}
+			expectedSwitchLBGroup := &nbdb.LoadBalancerGroup{
+				UUID: types.ClusterSwitchLBGroupName + "-UUID",
+				Name: types.ClusterSwitchLBGroupName,
+			}
+			expectedRouterLBGroup := &nbdb.LoadBalancerGroup{
+				UUID: types.ClusterRouterLBGroupName + "-UUID",
+				Name: types.ClusterRouterLBGroupName,
+			}
+			fakeOvn.startWithDBSetup(libovsdbtest.TestSetup{
+				NBData: []libovsdbtest.TestData{
+					&nbdb.LogicalSwitch{
+						UUID: types.OVNJoinSwitch + "-UUID",
+						Name: types.OVNJoinSwitch,
+					},
+					expectedOVNClusterRouter,
+					expectedNodeSwitch,
+					expectedClusterLBGroup,
+					expectedSwitchLBGroup,
+					expectedRouterLBGroup,
+				},
+			})
+
+			clusterIPSubnets := ovntest.MustParseIPNets("10.128.0.0/14")
+			hostSubnets := ovntest.MustParseIPNets("10.130.0.0/23")
+			joinLRPIPs := ovntest.MustParseIPNets("100.64.0.3/16")
+			defLRPIPs := ovntest.MustParseIPNets("100.64.0.1/16")
+			vlan5 := uint(5)
+			l3GatewayConfig := &util.L3GatewayConfig{
+				Mode:           config.GatewayModeShared,
+				ChassisID:      "SYSTEM-ID",
+				BridgeID:       "BRIDGE-ID",
+				InterfaceID:    "INTERFACE-ID",
+				MACAddress:     ovntest.MustParseMAC("11:22:33:44:55:66"),
+				IPAddresses:    ovntest.MustParseIPNets("169.255.33.2/24"),
+				NextHops:       ovntest.MustParseIPs("169.255.33.1"),
+				NodePortEnable: true,
+				VLANID:         &vlan5,
+			}
+			gwConfig := &GatewayConfig{
+				annoConfig:                 l3GatewayConfig,
+				hostSubnets:                hostSubnets,
+				clusterSubnets:             clusterIPSubnets,
+				gwRouterJoinCIDRs:          joinLRPIPs,
+				hostAddrs:                  nil,
+				externalIPs:                extractExternalIPs(l3GatewayConfig),
+				ovnClusterLRPToJoinIfAddrs: defLRPIPs,
+			}
+			var err error
+			fakeOvn.controller.defaultCOPPUUID, err = EnsureDefaultCOPP(fakeOvn.nbClient)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			// First sync: VLAN=5 -> TagRequest should be 5
+			err = newGatewayManager(fakeOvn, nodeName).gatewayInit(
+				nodeName,
+				gwConfig,
+				true,
+			)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			lsp := &nbdb.LogicalSwitchPort{Name: l3GatewayConfig.InterfaceID}
+			gomega.Eventually(func() *int {
+				if err := fakeOvn.nbClient.Get(context.Background(), lsp); err != nil {
+					return nil
+				}
+				return lsp.TagRequest
+			}).ShouldNot(gomega.BeNil())
+			gomega.Expect(*lsp.TagRequest).To(gomega.Equal(5))
+
+			// Simulate ovn-northd populating Tag from TagRequest. The fake
+			// harness has no northd, so write Tag directly.
+			intVlan5 := 5
+			lsp.Tag = &intVlan5
+			ops, err := fakeOvn.nbClient.Where(lsp).Update(lsp, &lsp.Tag)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			_, err = libovsdbops.TransactAndCheck(fakeOvn.nbClient, ops)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			// Second sync: simulate annotation flip 5 -> 0
+			vlan0 := uint(0)
+			l3GatewayConfig.VLANID = &vlan0
+			err = newGatewayManager(fakeOvn, nodeName).gatewayInit(
+				nodeName,
+				gwConfig,
+				true,
+			)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			gomega.Eventually(func() bool {
+				lsp := &nbdb.LogicalSwitchPort{Name: l3GatewayConfig.InterfaceID}
+				if err := fakeOvn.nbClient.Get(context.Background(), lsp); err != nil {
+					return false
+				}
+				return lsp.TagRequest == nil && lsp.Tag == nil
+			}).Should(gomega.BeTrue(), "Tag and TagRequest must both be cleared after VLAN annotation transitions to 0 (workaround for ovn-northd tag-clear bug)")
 		})
 
 		ginkgo.It("updates SNAT when join IP changes", func() {

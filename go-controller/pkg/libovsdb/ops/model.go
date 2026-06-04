@@ -595,7 +595,8 @@ func getFieldsToUpdate(model model.Model, fieldNames []ModelUpdateField) []inter
 func getAllUpdatableFields(model model.Model) []interface{} {
 	switch t := model.(type) {
 	case *nbdb.LogicalSwitchPort:
-		return []interface{}{&t.Addresses, &t.Type, &t.TagRequest, &t.Options, &t.PortSecurity}
+		// Tag included to work around ovn-northd not clearing it when tag_request clears.
+		return []interface{}{&t.Addresses, &t.Type, &t.Tag, &t.TagRequest, &t.Options, &t.PortSecurity}
 	case *nbdb.PortGroup:
 		return []interface{}{&t.ACLs, &t.Ports, &t.ExternalIDs}
 	default:
