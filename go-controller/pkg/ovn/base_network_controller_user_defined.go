@@ -81,7 +81,10 @@ func (bsnc *BaseUserDefinedNetworkController) AddUserDefinedNetworkResourceCommo
 		if !ok {
 			return fmt.Errorf("could not cast %T object to *knet.Pod", obj)
 		}
-		return bsnc.reconcilePodForUserDefinedNetwork(pod)
+		return bsnc.reconcilePodRequestForUserDefinedNetwork(userDefinedPodReconcileRequest{
+			state: podReconcilePresent,
+			pod:   pod,
+		})
 
 	case factory.NamespaceType:
 		ns, ok := obj.(*corev1.Namespace)
@@ -121,12 +124,15 @@ func (bsnc *BaseUserDefinedNetworkController) AddUserDefinedNetworkResourceCommo
 // called for User Defined Networks only.
 // Given an old and a new object; The inRetryCache boolean argument is to indicate if the given resource
 // is in the retryCache or not.
-func (bsnc *BaseUserDefinedNetworkController) UpdateUserDefinedNetworkResourceCommon(objType reflect.Type, oldObj, newObj interface{}, inRetryCache bool) error {
+func (bsnc *BaseUserDefinedNetworkController) UpdateUserDefinedNetworkResourceCommon(objType reflect.Type, oldObj, newObj interface{}, _ bool) error {
 	switch objType {
 	case factory.PodType:
 		newPod := newObj.(*corev1.Pod)
 
-		return bsnc.reconcilePodForUserDefinedNetwork(newPod)
+		return bsnc.reconcilePodRequestForUserDefinedNetwork(userDefinedPodReconcileRequest{
+			state: podReconcilePresent,
+			pod:   newPod,
+		})
 
 	case factory.NamespaceType:
 		oldNs, newNs := oldObj.(*corev1.Namespace), newObj.(*corev1.Namespace)
@@ -188,7 +194,11 @@ func (bsnc *BaseUserDefinedNetworkController) DeleteUserDefinedNetworkResourceCo
 		if cachedObj != nil {
 			portInfoMap = cachedObj.(map[string]*lpInfo)
 		}
-		return bsnc.deletePodForUserDefinedNetwork(pod, portInfoMap)
+		return bsnc.reconcilePodRequestForUserDefinedNetwork(userDefinedPodReconcileRequest{
+			state:              podReconcileDeleted,
+			pod:                pod,
+			appliedPortInfoMap: portInfoMap,
+		})
 
 	case factory.NamespaceType:
 		ns := obj.(*corev1.Namespace)
@@ -216,20 +226,24 @@ func (bsnc *BaseUserDefinedNetworkController) DeleteUserDefinedNetworkResourceCo
 	return nil
 }
 
-// reconcilePodForUserDefinedNetwork is the pod reconciliation entry point for
-// UDN controller add/update events.
-func (bsnc *BaseUserDefinedNetworkController) reconcilePodForUserDefinedNetwork(pod *corev1.Pod) error {
-	return bsnc.reconcilePodStateForUserDefinedNetwork(podReconcilePresent, pod, nil)
+type userDefinedPodReconcileRequest struct {
+	state              podReconcileState
+	pod                *corev1.Pod
+	appliedPortInfoMap map[string]*lpInfo
 }
 
-func (bsnc *BaseUserDefinedNetworkController) reconcilePodStateForUserDefinedNetwork(state podReconcileState, pod *corev1.Pod, portInfoMap map[string]*lpInfo) error {
-	switch state {
+func (bsnc *BaseUserDefinedNetworkController) reconcilePodRequestForUserDefinedNetwork(request userDefinedPodReconcileRequest) error {
+	if request.pod == nil {
+		return fmt.Errorf("pod reconcile request for state %q on network %s is missing pod", request.state, bsnc.GetNetworkName())
+	}
+
+	switch request.state {
 	case podReconcilePresent:
-		return bsnc.reconcilePresentPodForUserDefinedNetwork(pod)
+		return bsnc.reconcilePresentPodForUserDefinedNetwork(request.pod)
 	case podReconcileDeleted:
-		return bsnc.reconcileDeletedPodForUserDefinedNetwork(pod, portInfoMap)
+		return bsnc.reconcileDeletedPodForUserDefinedNetwork(request.pod, request.appliedPortInfoMap)
 	default:
-		return fmt.Errorf("unsupported pod reconcile state %q for pod %s/%s on network %s", state, pod.Namespace, pod.Name, bsnc.GetNetworkName())
+		return fmt.Errorf("unsupported pod reconcile state %q for pod %s/%s on network %s", request.state, request.pod.Namespace, request.pod.Name, bsnc.GetNetworkName())
 	}
 }
 
@@ -489,12 +503,6 @@ func (bsnc *BaseUserDefinedNetworkController) addLogicalPortToNetworkForNAD(pod 
 	}
 
 	return nil
-}
-
-// deletePodForUserDefinedNetwork is the current delete entry point for UDN
-// controller pod events.
-func (bsnc *BaseUserDefinedNetworkController) deletePodForUserDefinedNetwork(pod *corev1.Pod, portInfoMap map[string]*lpInfo) error {
-	return bsnc.reconcilePodStateForUserDefinedNetwork(podReconcileDeleted, pod, portInfoMap)
 }
 
 // reconcileDeletedPodForUserDefinedNetwork uses the delete event object as the

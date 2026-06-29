@@ -105,20 +105,25 @@ const (
 	podReconcileDeleted podReconcileState = "deleted"
 )
 
-func (oc *DefaultNetworkController) reconcilePodState(state podReconcileState, pod *corev1.Pod, portInfo *lpInfo) error {
-	switch state {
-	case podReconcilePresent:
-		return oc.reconcilePresentPod(pod)
-	case podReconcileDeleted:
-		return oc.reconcileDeletedPod(pod, portInfo)
-	default:
-		return fmt.Errorf("unsupported pod reconcile state %q for pod %s/%s", state, pod.Namespace, pod.Name)
-	}
+type defaultPodReconcileRequest struct {
+	state           podReconcileState
+	pod             *corev1.Pod
+	appliedPortInfo *lpInfo
 }
 
-// reconcilePod is the current add/update entry point for the default network.
-func (oc *DefaultNetworkController) reconcilePod(pod *corev1.Pod) error {
-	return oc.reconcilePodState(podReconcilePresent, pod, nil)
+func (oc *DefaultNetworkController) reconcilePodRequest(request defaultPodReconcileRequest) error {
+	if request.pod == nil {
+		return fmt.Errorf("pod reconcile request for state %q is missing pod", request.state)
+	}
+
+	switch request.state {
+	case podReconcilePresent:
+		return oc.reconcilePresentPod(request.pod)
+	case podReconcileDeleted:
+		return oc.reconcileDeletedPod(request.pod, request.appliedPortInfo)
+	default:
+		return fmt.Errorf("unsupported pod reconcile state %q for pod %s/%s", request.state, request.pod.Namespace, request.pod.Name)
+	}
 }
 
 // reconcilePresentPod computes the add/update decision from current controller
@@ -206,11 +211,6 @@ func (oc *DefaultNetworkController) ensureRemoteZonePod(pod *corev1.Pod) error {
 		return kubevirt.EnsureRemoteZonePodAddressesToNodeRoute(oc.watchFactory, oc.nbClient, pod)
 	}
 	return nil
-}
-
-// deletePod is the current delete entry point for the default network.
-func (oc *DefaultNetworkController) deletePod(pod *corev1.Pod, portInfo *lpInfo) error {
-	return oc.reconcilePodState(podReconcileDeleted, pod, portInfo)
 }
 
 // reconcileDeletedPod uses the delete event object as the desired-absent

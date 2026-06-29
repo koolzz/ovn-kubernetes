@@ -1010,7 +1010,10 @@ func (h *defaultNetworkControllerEventHandler) AddResource(obj interface{}, from
 		if !ok {
 			return fmt.Errorf("could not cast %T object to *corev1.Pod", obj)
 		}
-		return h.oc.reconcilePod(pod)
+		return h.oc.reconcilePodRequest(defaultPodReconcileRequest{
+			state: podReconcilePresent,
+			pod:   pod,
+		})
 
 	case factory.EgressIPType:
 		eIP := obj.(*egressipv1.EgressIP)
@@ -1084,12 +1087,15 @@ func (h *defaultNetworkControllerEventHandler) AddResource(obj interface{}, from
 // type and returns the error, if any, yielded during the object update.
 // Given an old and a new object; The inRetryCache boolean argument is to indicate if the given resource
 // is in the retryCache or not.
-func (h *defaultNetworkControllerEventHandler) UpdateResource(oldObj, newObj interface{}, inRetryCache bool) error {
+func (h *defaultNetworkControllerEventHandler) UpdateResource(oldObj, newObj interface{}, _ bool) error {
 	switch h.objType {
 	case factory.PodType:
 		newPod := newObj.(*corev1.Pod)
 
-		return h.oc.reconcilePod(newPod)
+		return h.oc.reconcilePodRequest(defaultPodReconcileRequest{
+			state: podReconcilePresent,
+			pod:   newPod,
+		})
 
 	case factory.EgressIPType:
 		oldEIP := oldObj.(*egressipv1.EgressIP)
@@ -1164,7 +1170,11 @@ func (h *defaultNetworkControllerEventHandler) DeleteResource(obj, cachedObj int
 		if cachedObj != nil {
 			portInfo = cachedObj.(*lpInfo)
 		}
-		return h.oc.deletePod(pod, portInfo)
+		return h.oc.reconcilePodRequest(defaultPodReconcileRequest{
+			state:           podReconcileDeleted,
+			pod:             pod,
+			appliedPortInfo: portInfo,
+		})
 
 	case factory.EgressIPType:
 		eIP := obj.(*egressipv1.EgressIP)
