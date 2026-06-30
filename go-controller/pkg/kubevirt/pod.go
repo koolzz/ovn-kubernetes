@@ -107,7 +107,33 @@ func findPodAnnotation(client *factory.WatchFactory, pod *corev1.Pod, nadKey str
 			return podAnnotation, nil
 		}
 	}
-	return nil, fmt.Errorf("missing virtual machine pod annotation at stale pods for %s/%s", pod.Namespace, pod.Name)
+	for _, vmPod := range vmPods {
+		if isOlderPod(vmPod, pod) {
+			return nil, fmt.Errorf("missing virtual machine pod annotation at stale pods for %s/%s", pod.Namespace, pod.Name)
+		}
+	}
+	// No related pod has an OVN annotation yet and this is the oldest pod for
+	// the VM, so let normal pod allocation create the first annotation.
+	return nil, nil
+}
+
+func isOlderPod(candidate, pod *corev1.Pod) bool {
+	if candidate.CreationTimestamp.Time.Before(pod.CreationTimestamp.Time) {
+		return true
+	}
+	if pod.CreationTimestamp.Time.Before(candidate.CreationTimestamp.Time) {
+		return false
+	}
+	if candidate.Namespace != pod.Namespace {
+		return candidate.Namespace < pod.Namespace
+	}
+	if candidate.Name != pod.Name {
+		return candidate.Name < pod.Name
+	}
+	if candidate.UID != pod.UID {
+		return string(candidate.UID) < string(pod.UID)
+	}
+	return false
 }
 
 // EnsurePodAnnotationForVM extracts OVN pod annotations from the source VM pod
@@ -195,6 +221,9 @@ func IsMigratedSourcePodStale(client *factory.WatchFactory, pod *corev1.Pod) (bo
 	}
 
 	for _, vmPod := range vmPods {
+		if util.PodCompleted(vmPod) {
+			continue
+		}
 		if vmPod.CreationTimestamp.After(pod.CreationTimestamp.Time) {
 			return true, nil
 		}
@@ -327,6 +356,14 @@ func NewVMDescriptionFromPod(pod *corev1.Pod) (*VMDescription, error) {
 // when all the pods for the same VM as `pod` argument are completed.
 func CleanUpLiveMigratablePod(nbClient libovsdbclient.Client, watchFactory *factory.WatchFactory, pod *corev1.Pod) error {
 	if !IsPodLiveMigratable(pod) {
+		return nil
+	}
+
+	liveMigrationStatus, err := DiscoverLiveMigrationStatus(watchFactory.PodCoreInformer().Lister(), pod)
+	if err != nil {
+		return fmt.Errorf("failed cleaning up VM when checking live migration status: %v", err)
+	}
+	if liveMigrationStatus != nil {
 		return nil
 	}
 
@@ -576,7 +613,7 @@ func DiscoverLiveMigrationStatus(podLister listersv1.PodLister, pod *corev1.Pod)
 	if len(vmPods) < 2 {
 		// If the only remaining pod has the migration target ready
 		// annotation, the migration completed and the source pod is gone.
-		if len(vmPods) == 1 && isTargetPodReady(vmPods[0]) {
+		if len(vmPods) == 1 && !util.PodCompleted(vmPods[0]) && isTargetPodReady(vmPods[0]) {
 			return &LiveMigrationStatus{
 				TargetPod: vmPods[0],
 				State:     LiveMigrationTargetDomainReady,

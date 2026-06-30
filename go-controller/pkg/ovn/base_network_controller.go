@@ -29,6 +29,7 @@ import (
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/allocator/pod"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	controllerutil "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube"
@@ -92,8 +93,10 @@ type BaseNetworkController struct {
 	nadKeysLock sync.Mutex
 	lastNADKeys sets.Set[string]
 
-	// retry framework for pods
-	retryPods *ovnretry.RetryFramework
+	// podController reconciles pod state from keys using the informer lister.
+	podController            controllerutil.Controller
+	podControllerInitialSync func([]interface{}) error
+	podControllerStarted     bool
 	// retry framework for namespaces
 	retryNamespaces *ovnretry.RetryFramework
 	// retry framework for network policies
@@ -107,8 +110,6 @@ type BaseNetworkController struct {
 	// node annotation cache for shared node controllers (optional)
 	nodeAnnotationCache *nodecontroller.NodeAnnotationCache
 
-	// pod events factory handler
-	podHandler *factory.Handler
 	// namespace events factory Handler
 	namespaceHandler *factory.Handler
 
@@ -120,6 +121,11 @@ type BaseNetworkController struct {
 
 	// A cache of all logical ports known to the controller
 	logicalPortCache *PortCache
+	// appliedPods stores the last pod state available to reconstruct teardown,
+	// keyed by namespace/name.
+	appliedPods *syncmap.SyncMap[*corev1.Pod]
+	// deletedPods stores completed pod UIDs whose cleanup already succeeded.
+	deletedPods *syncmap.SyncMap[string]
 	// optional callback for consumers that need to react when a pod's logical
 	// port info is inserted/refreshed in logicalPortCache.
 	onLogicalPortCacheAdd func(pod *corev1.Pod, nadKey string)
@@ -272,7 +278,7 @@ func (oc *BaseNetworkController) doReconcile(reconcileRoutes, reconcilePendingPo
 	}
 
 	if reconcilePendingPods {
-		if err := ovnretry.RequeuePendingPods(oc.watchFactory, oc.GetNetInfo(), oc.retryPods); err != nil {
+		if err := oc.requeuePendingPods(); err != nil {
 			klog.Errorf("Failed to requeue pending pods for network %s: %v", oc.GetNetworkName(), err)
 		}
 	}
@@ -671,24 +677,20 @@ func (bnc *BaseNetworkController) addAllPodsOnNode(nodeName string) []error {
 		klog.Errorf("Unable to list existing pods for synchronizing node: %s, existing pods on this node may not function",
 			nodeName)
 	} else {
-		klog.V(5).Infof("When adding node %s for network %s, found %d pods to add to retryPods", nodeName, bnc.GetNetworkName(), len(pods))
+		klog.V(5).Infof("When adding node %s for network %s, found %d pods to reconcile", nodeName, bnc.GetNetworkName(), len(pods))
 		for _, pod := range pods {
-			pod := *pod
-			if util.PodCompleted(&pod) {
+			if util.PodCompleted(pod) {
 				continue
 			}
 			if pod.Spec.NodeName != nodeName {
 				continue
 			}
-			klog.V(5).Infof("Adding pod %s/%s to retryPods for network %s", pod.Namespace, pod.Name, bnc.GetNetworkName())
-			err = bnc.retryPods.AddRetryObjWithAddNoBackoff(&pod)
-			if err != nil {
+			if err = bnc.enqueuePod(pod, "node reconcile"); err != nil {
 				errs = append(errs, err)
-				klog.Errorf("Failed to add pod %s/%s to retryPods for network %s: %v", pod.Namespace, pod.Name, bnc.GetNetworkName(), err)
+				klog.Errorf("Failed to queue pod %s/%s for network %s: %v", pod.Namespace, pod.Name, bnc.GetNetworkName(), err)
 			}
 		}
 	}
-	bnc.retryPods.RequestRetryObjs()
 	return errs
 }
 

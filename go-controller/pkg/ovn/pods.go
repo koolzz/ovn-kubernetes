@@ -169,6 +169,9 @@ func (oc *DefaultNetworkController) syncPods(pods []interface{}) error {
 
 	// keep track of which pods might have already been released
 	oc.trackPodsReleasedBeforeStartup(annotatedLocalPods)
+	for pod := range annotatedLocalPods {
+		oc.recordAppliedPod(pod)
+	}
 
 	return oc.deleteStaleLogicalSwitchPorts(expectedLogicalPorts)
 }

@@ -129,23 +129,7 @@ func (h *layer2UserDefinedNetworkControllerEventHandler) DeleteResource(obj, cac
 // Given an old and a new object; The inRetryCache boolean argument is to indicate if the given resource
 // is in the retryCache or not.
 func (h *layer2UserDefinedNetworkControllerEventHandler) UpdateResource(oldObj, newObj interface{}, inRetryCache bool) error {
-	switch h.objType {
-	case factory.PodType:
-		newPod := newObj.(*corev1.Pod)
-		if err := h.oc.reconcilePodRequestForUserDefinedNetwork(userDefinedPodReconcileRequest{
-			state: podReconcilePresent,
-			pod:   newPod,
-		}); err != nil {
-			return err
-		}
-
-		if h.oc.isPodScheduledinLocalZone(newPod) {
-			return h.oc.updateLocalPodEvent(newPod)
-		}
-		return nil
-	default:
-		return h.oc.UpdateUserDefinedNetworkResourceCommon(h.objType, oldObj, newObj, inRetryCache)
-	}
+	return h.oc.UpdateUserDefinedNetworkResourceCommon(h.objType, oldObj, newObj, inRetryCache)
 }
 
 func (h *layer2UserDefinedNetworkControllerEventHandler) SyncFunc(objs []interface{}) error {
@@ -156,9 +140,6 @@ func (h *layer2UserDefinedNetworkControllerEventHandler) SyncFunc(objs []interfa
 		syncFunc = h.syncFunc
 	} else {
 		switch h.objType {
-		case factory.PodType:
-			syncFunc = h.oc.syncPodsForUserDefinedNetwork
-
 		case factory.NamespaceType:
 			syncFunc = h.oc.syncNamespaces
 
@@ -622,7 +603,7 @@ func (oc *Layer2UserDefinedNetworkController) SyncNodes(nodes []*corev1.Node) er
 }
 
 func (oc *Layer2UserDefinedNetworkController) initRetryFramework() {
-	oc.retryPods = oc.newRetryFramework(factory.PodType)
+	oc.initPodController(oc.controllerName+"/pod", oc.reconcilePodKey, oc.syncPodsForUserDefinedNetwork)
 
 	// When a user-defined network is enabled as a primary network for namespace,
 	// then watch for namespace and network policy events.
@@ -638,6 +619,29 @@ func (oc *Layer2UserDefinedNetworkController) initRetryFramework() {
 		oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
 		oc.retryMultiNetworkPolicies = oc.newRetryFramework(factory.MultiNetworkPolicyType)
 	}
+}
+
+func (oc *Layer2UserDefinedNetworkController) reconcilePodKey(key string) error {
+	pod, found, err := oc.getPodForReconcile(key)
+	if err != nil {
+		return err
+	}
+	var podExpectedOnNetwork bool
+	if found && !util.PodCompleted(pod) {
+		podExpectedOnNetwork, err = oc.podExpectedOnUserDefinedNetwork(pod)
+		if err != nil {
+			return err
+		}
+	}
+
+	if err := oc.reconcilePodKeyForUserDefinedNetwork(key); err != nil {
+		return err
+	}
+
+	if found && podExpectedOnNetwork && oc.isPodScheduledinLocalZone(pod) {
+		return oc.updateLocalPodEvent(pod)
+	}
+	return nil
 }
 
 // newRetryFramework builds and returns a retry framework for the input resource type;

@@ -129,9 +129,6 @@ func (h *LocalnetUserDefinedNetworkControllerEventHandler) SyncFunc(objs []inter
 		syncFunc = h.syncFunc
 	} else {
 		switch h.objType {
-		case factory.PodType:
-			syncFunc = h.oc.syncPodsForUserDefinedNetwork
-
 		case factory.NamespaceType:
 			syncFunc = h.oc.syncNamespaces
 
@@ -317,7 +314,7 @@ func (oc *LocalnetUserDefinedNetworkController) SyncNodes(nodes []*corev1.Node) 
 }
 
 func (oc *LocalnetUserDefinedNetworkController) initRetryFramework() {
-	oc.retryPods = oc.newRetryFramework(factory.PodType)
+	oc.initPodController(oc.controllerName+"/pod", oc.reconcilePodKeyForUserDefinedNetwork, oc.syncPodsForUserDefinedNetwork)
 
 	// For secondary networks, we don't have to watch namespace events if
 	// multi-network policy support is not enabled. We don't support

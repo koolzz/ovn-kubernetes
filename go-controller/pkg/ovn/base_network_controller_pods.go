@@ -786,15 +786,7 @@ func (bnc *BaseNetworkController) isPodScheduledinLocalZone(pod *corev1.Pod) boo
 
 // WatchPods starts the watching of the Pod resource and calls back the appropriate handler logic
 func (bnc *BaseNetworkController) WatchPods() error {
-	if bnc.podHandler != nil {
-		return nil
-	}
-
-	handler, err := bnc.retryPods.WatchResource()
-	if err == nil {
-		bnc.podHandler = handler
-	}
-	return err
+	return bnc.startPodController()
 }
 
 func calculateStaticIPs(podDesc string, ips []string) ([]*net.IPNet, error) {

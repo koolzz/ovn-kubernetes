@@ -1092,6 +1092,67 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 			By("ensuring the pod is not filtered out by the UDN controller")
 			Expect(l2Controller.FilterOutResource(factory.PodType, remotePod)).To(BeFalse())
 		})
+
+		It("seeds applied pod state only for pods on the UDN during initial sync", func() {
+			app.Action = func(*cli.Context) error {
+				config.OVNKubernetesFeature.EnableMultiNetwork = true
+				config.OVNKubernetesFeature.EnableNetworkSegmentation = true
+				config.Default.Zone = nodeName
+				config.Gateway.Mode = config.GatewayModeShared
+
+				netInfo := dummySecondaryLayer2UserDefinedNetwork("100.200.0.0/16")
+				podInfo := dummyL2TestPod(ns, netInfo, 0, 0)
+				networkPod := newMultiHomedPod(podInfo, netInfo)
+				unrelatedPod := testing.NewPod(ns, "unrelated-pod", nodeName, "10.128.1.99")
+
+				nad, err := newNetworkAttachmentDefinition(ns, nadName, *netInfo.netconf())
+				Expect(err).NotTo(HaveOccurred())
+				testNode, err := newNodeWithUserDefinedNetworks(nodeName, "192.168.126.202/24", netInfo)
+				Expect(err).NotTo(HaveOccurred())
+
+				fakeOvn.startWithDBSetup(
+					initialDB,
+					&corev1.NamespaceList{Items: []corev1.Namespace{*testing.NewNamespace(ns)}},
+					&corev1.NodeList{Items: []corev1.Node{*testNode}},
+					&corev1.PodList{Items: []corev1.Pod{*networkPod, *unrelatedPod}},
+					&nadapi.NetworkAttachmentDefinitionList{Items: []nadapi.NetworkAttachmentDefinition{*nad}},
+				)
+
+				Expect(fakeOvn.NewUserDefinedNetworkController(nad)).To(Succeed())
+				l2Controller, ok := fakeOvn.fullL2UDNControllers[userDefinedNetworkName]
+				Expect(ok).To(BeTrue())
+				Expect(l2Controller.init()).To(Succeed())
+
+				userDefinedNetController, ok := fakeOvn.userDefinedNetworkControllers[userDefinedNetworkName]
+				Expect(ok).To(BeTrue())
+				podInfo.populateUserDefinedNetworkLogicalSwitchCache(userDefinedNetController)
+
+				Expect(userDefinedNetController.bnc.runPodControllerInitialSync()).To(Succeed())
+
+				networkPodKey := networkPod.Namespace + "/" + networkPod.Name
+				unrelatedPodKey := unrelatedPod.Namespace + "/" + unrelatedPod.Name
+				_, ok = userDefinedNetController.bnc.getAppliedPod(networkPodKey)
+				Expect(ok).To(BeTrue())
+				_, ok = userDefinedNetController.bnc.getAppliedPod(unrelatedPodKey)
+				Expect(ok).To(BeFalse())
+
+				deletedPod := unrelatedPod.DeepCopy()
+				deletedPod.Name = "deleted-pod"
+				deletedPod.UID = ktypes.UID("deleted-pod-uid")
+				deletedPodKey := deletedPod.Namespace + "/" + deletedPod.Name
+				userDefinedNetController.bnc.markDeletedPod(deletedPodKey, deletedPod)
+				_, ok = userDefinedNetController.bnc.deletedPods.Load(deletedPodKey)
+				Expect(ok).To(BeTrue())
+
+				Expect(userDefinedNetController.bnc.reconcilePodKeyForUserDefinedNetwork(deletedPodKey)).To(Succeed())
+				_, ok = userDefinedNetController.bnc.deletedPods.Load(deletedPodKey)
+				Expect(ok).To(BeFalse())
+
+				return nil
+			}
+
+			Expect(app.Run([]string{app.Name})).To(Succeed())
+		})
 	})
 })
 

@@ -52,6 +52,10 @@ func CreateDefaultRouteToExternal(nbClient libovsdbclient.Client, clusterRouter,
 
 		clusterSubnetPrefixLen, _ := clusterSubnet.CIDR.Mask.Size()
 		p := func(lrsr *nbdb.LogicalRouterStaticRoute) bool {
+			samePolicy := lrsr.Policy != nil && *lrsr.Policy == nbdb.LogicalRouterStaticRoutePolicySrcIP
+			if lrsr.IPPrefix == clusterSubnet.CIDR.String() && lrsr.Nexthop == gatewayIP.IP.String() && samePolicy {
+				return true
+			}
 			// Replace any existing LRSR for the cluster subnet.
 			// Make sure you don't wipe out the existing LRSR via mp0 for the local node subnet
 			// (e.g. 10.244.1.0/24 10.244.1.2 src-ip) and take into account cluster subnet expansion,
@@ -75,7 +79,7 @@ func CreateDefaultRouteToExternal(nbClient libovsdbclient.Client, clusterRouter,
 			return clusterSubnet.CIDR.IP.Equal(itemCIDR.IP) && // even after expansion, cluster network address cannot change
 				clusterSubnetPrefixLen <= itemPrefixLen && // cluster subnet mask len can only be decreased
 				itemPrefixLen < clusterSubnet.HostSubnetLength && // don't match the local node subnet route
-				lrsr.Policy != nil && *lrsr.Policy == nbdb.LogicalRouterStaticRoutePolicySrcIP
+				samePolicy
 
 		}
 		if err := libovsdbops.CreateOrReplaceLogicalRouterStaticRouteWithPredicate(nbClient, clusterRouter, &lrsr, p); err != nil {

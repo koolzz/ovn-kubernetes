@@ -22,6 +22,7 @@ import (
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kubevirt"
 	libovsdbutil "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/util"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics/recorders"
 	addressset "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/address_set"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/addresssetmanager"
 	anpcontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/controller/admin_network_policy"
@@ -98,32 +99,61 @@ func (oc *DefaultNetworkController) recordPodEvent(reason string, addErr error, 
 	}
 }
 
-type podReconcileState string
+func (oc *DefaultNetworkController) reconcilePodKey(key string) error {
+	pod, found, err := oc.getPodForReconcile(key)
+	if err != nil {
+		return err
+	}
+	if !found {
+		appliedPod, ok := oc.getAppliedPod(key)
+		if !ok {
+			oc.clearDeletedPod(key)
+			return nil
+		}
+		return oc.reconcileDeletedPodFromKey(key, podForAbsentReconcile(appliedPod))
+	}
 
-const (
-	podReconcilePresent podReconcileState = "present"
-	podReconcileDeleted podReconcileState = "deleted"
-)
-
-type defaultPodReconcileRequest struct {
-	state           podReconcileState
-	pod             *corev1.Pod
-	appliedPortInfo *lpInfo
+	if util.PodCompleted(pod) {
+		if oc.wasDeletedPodProcessed(key, pod) {
+			return nil
+		}
+		return oc.reconcileDeletedPodFromKey(key, pod)
+	}
+	if appliedPod, ok := oc.getAppliedPod(key); ok && oc.podAppliedStateChanged(appliedPod, pod) {
+		if err := oc.reconcileDeletedPodFromKey(key, appliedPod); err != nil {
+			return err
+		}
+	}
+	oc.clearDeletedPod(key)
+	return oc.reconcilePresentPodFromKey(key, pod)
 }
 
-func (oc *DefaultNetworkController) reconcilePodRequest(request defaultPodReconcileRequest) error {
-	if request.pod == nil {
-		return fmt.Errorf("pod reconcile request for state %q is missing pod", request.state)
+func (oc *DefaultNetworkController) reconcilePresentPodFromKey(key string, pod *corev1.Pod) error {
+	if _, ok := oc.getAppliedPod(key); !ok {
+		oc.podRecorder.AddPod(pod.UID)
 	}
+	recorders.GetConfigDurationRecorder().Start("pod", pod.Namespace, pod.Name)
+	if err := oc.reconcilePresentPod(pod); err != nil {
+		oc.recordPodEvent("ErrorReconcilingPod", err, pod)
+		return err
+	}
+	oc.recordAppliedPod(pod)
+	recorders.GetConfigDurationRecorder().End("pod", pod.Namespace, pod.Name)
+	return nil
+}
 
-	switch request.state {
-	case podReconcilePresent:
-		return oc.reconcilePresentPod(request.pod)
-	case podReconcileDeleted:
-		return oc.reconcileDeletedPod(request.pod, request.appliedPortInfo)
-	default:
-		return fmt.Errorf("unsupported pod reconcile state %q for pod %s/%s", request.state, request.pod.Namespace, request.pod.Name)
+func (oc *DefaultNetworkController) reconcileDeletedPodFromKey(key string, pod *corev1.Pod) error {
+	recorders.GetConfigDurationRecorder().Start("pod", pod.Namespace, pod.Name)
+	portInfo := oc.getPortInfo(pod)
+	if err := oc.reconcileDeletedPod(pod, portInfo); err != nil {
+		oc.recordPodEvent("ErrorReconcilingPod", err, pod)
+		return err
 	}
+	oc.forgetAppliedPod(key)
+	oc.markDeletedPod(key, pod)
+	oc.podRecorder.CleanPod(pod.UID)
+	recorders.GetConfigDurationRecorder().End("pod", pod.Namespace, pod.Name)
+	return nil
 }
 
 // reconcilePresentPod computes the add/update decision from current controller
@@ -213,8 +243,8 @@ func (oc *DefaultNetworkController) ensureRemoteZonePod(pod *corev1.Pod) error {
 	return nil
 }
 
-// reconcileDeletedPod uses the delete event object as the desired-absent
-// context while cleanup still depends on legacy remove helpers.
+// reconcileDeletedPod uses the supplied pod state as the desired-absent context
+// while cleanup still delegates to the legacy remove helpers.
 func (oc *DefaultNetworkController) reconcileDeletedPod(pod *corev1.Pod, portInfo *lpInfo) error {
 	return oc.removePod(pod, portInfo)
 }
@@ -232,6 +262,10 @@ func (oc *DefaultNetworkController) removePod(pod *corev1.Pod, portInfo *lpInfo)
 		}
 	}
 
+	if err := oc.reconcileFailedLiveMigrationSource(pod); err != nil {
+		return err
+	}
+
 	err := kubevirt.CleanUpLiveMigratablePod(oc.nbClient, oc.watchFactory, pod)
 	if err != nil {
 		return err
@@ -239,6 +273,21 @@ func (oc *DefaultNetworkController) removePod(pod *corev1.Pod, portInfo *lpInfo)
 
 	oc.forgetPodReleasedBeforeStartup(string(pod.UID), ovntypes.DefaultNetworkName)
 	return nil
+}
+
+func (oc *DefaultNetworkController) reconcileFailedLiveMigrationSource(pod *corev1.Pod) error {
+	if !kubevirt.IsPodLiveMigratable(pod) {
+		return nil
+	}
+	liveMigrationStatus, err := kubevirt.DiscoverLiveMigrationStatus(oc.watchFactory.PodCoreInformer().Lister(), pod)
+	if err != nil {
+		return err
+	}
+	if liveMigrationStatus == nil || liveMigrationStatus.State != kubevirt.LiveMigrationFailed || liveMigrationStatus.SourcePod == nil {
+		return nil
+	}
+	addPort := oc.shouldEnsurePodLogicalPort(liveMigrationStatus.SourcePod, ovntypes.DefaultNetworkName)
+	return oc.ensurePod(liveMigrationStatus.SourcePod, addPort)
 }
 
 // removeLocalZonePod tries to tear down a local zone pod. It returns nil on success and error on failure;
