@@ -1370,6 +1370,9 @@ var _ = Describe("NetworkQoS on a DHCP-IPAM localnet network", func() {
 
 		nad := newDHCPLocalnetNAD("dhcpnet", "default", dhcpNadKey)
 		nad.Labels = map[string]string{"name": "dhcpnet"}
+		nadNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name: "default", Labels: map[string]string{"qos": "enabled"}, ResourceVersion: "1",
+		}}
 
 		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 			Name: nqosNamespace, Labels: map[string]string{"app": "client"}}}
@@ -1397,7 +1400,8 @@ var _ = Describe("NetworkQoS on a DHCP-IPAM localnet network", func() {
 				NetworkSelectors: []crdtypes.NetworkSelector{{
 					NetworkSelectionType: crdtypes.NetworkAttachmentDefinitions,
 					NetworkAttachmentDefinitionSelector: &crdtypes.NetworkAttachmentDefinitionSelector{
-						NetworkSelector: metav1.LabelSelector{MatchLabels: map[string]string{"name": "dhcpnet"}},
+						NetworkSelector:   metav1.LabelSelector{MatchLabels: map[string]string{"name": "selected-dhcpnet"}},
+						NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"qos": "enabled"}},
 					},
 				}},
 				Priority:    100,
@@ -1417,7 +1421,7 @@ var _ = Describe("NetworkQoS on a DHCP-IPAM localnet network", func() {
 			&nbdb.LogicalSwitch{Name: dhcpSwitch},
 		}}
 
-		ovnClientset := util.GetOVNClientset(ns, node1, clientPod, nqosDHCP, nad)
+		ovnClientset := util.GetOVNClientset(ns, nadNamespace, node1, clientPod, nqosDHCP, nad)
 		fakeKubeClient = ovnClientset.KubeClient
 		fakeNQoSClient = ovnClientset.NetworkQoSClient
 		initEnv(ovnClientset, initialDB)
@@ -1427,7 +1431,17 @@ var _ = Describe("NetworkQoS on a DHCP-IPAM localnet network", func() {
 		Expect(err).NotTo(HaveOccurred())
 		dhcpNadInfo := util.NewMutableNetInfo(dhcpImmutableNadInfo)
 		dhcpNadInfo.AddNADs(dhcpNadKey)
-		initNetworkQoSController(dhcpNadInfo, []string{dhcpNadKey}, dhcpAddrsetFactory, dhcpControllerName)
+		dhcpController := initNetworkQoSController(dhcpNadInfo, []string{dhcpNadKey}, dhcpAddrsetFactory, dhcpControllerName)
+
+		By("ignoring Pod events while the policy selects another NAD")
+		Expect(dhcpController.hasNetworkQoS()).To(BeTrue())
+		Expect(dhcpController.hasRelevantPolicy.Load()).To(BeFalse())
+
+		By("activating the policy when NAD labels start matching, without a Pod event")
+		nad.Labels["name"] = "selected-dhcpnet"
+		_, err = ovnClientset.NetworkAttchDefClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(nad.Namespace).Update(context.Background(), nad, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(dhcpController.hasRelevantPolicy.Load).Should(BeTrue())
 
 		By("keeping the source address set empty while the pod has no lease")
 		eventuallyAddressSetHasNo(dhcpAddrsetFactory, nqosNamespace, "dhcp-qos", "src", "0", dhcpControllerName, lease1)
@@ -1468,5 +1482,24 @@ var _ = Describe("NetworkQoS on a DHCP-IPAM localnet network", func() {
 		// is unchanged) and the stale address must be deleted, not accumulated
 		eventuallyAddressSetHas(dhcpAddrsetFactory, nqosNamespace, "dhcp-qos", "src", "0", dhcpControllerName, lease2)
 		eventuallyAddressSetHasNo(dhcpAddrsetFactory, nqosNamespace, "dhcp-qos", "src", "0", dhcpControllerName, lease1)
+
+		By("removing QoS when the NAD namespace stops matching")
+		nadNamespace.Labels["qos"] = "disabled"
+		nadNamespace.ResourceVersion = "2"
+		_, err = fakeKubeClient.CoreV1().Namespaces().Update(context.Background(), nadNamespace, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(dhcpController.hasRelevantPolicy.Load).Should(BeFalse())
+		eventuallyExpectNoQoS(dhcpControllerName, nqosNamespace, "dhcp-qos", 0)
+		eventuallySwitchHasNoQoS(dhcpSwitch, qos)
+
+		By("resyncing existing Pods when the namespace matches again")
+		nadNamespace.Labels["qos"] = "enabled"
+		nadNamespace.ResourceVersion = "3"
+		_, err = fakeKubeClient.CoreV1().Namespaces().Update(context.Background(), nadNamespace, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(dhcpController.hasRelevantPolicy.Load).Should(BeTrue())
+		eventuallyAddressSetHas(dhcpAddrsetFactory, nqosNamespace, "dhcp-qos", "src", "0", dhcpControllerName, lease2)
+		qos = eventuallyExpectQoS(dhcpControllerName, nqosNamespace, "dhcp-qos", 0)
+		eventuallySwitchHasQoS(dhcpSwitch, qos)
 	})
 })

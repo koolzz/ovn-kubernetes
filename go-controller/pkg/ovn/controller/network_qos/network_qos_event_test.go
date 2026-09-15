@@ -24,10 +24,12 @@ func newEventTestController(tb testing.TB) (*Controller, cache.Indexer) {
 	c := &Controller{
 		NetInfo:            &util.DefaultNetInfo{},
 		nqosLister:         nqoslister.NewNetworkQoSLister(indexer),
+		nqosQueue:          workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 		nqosPodQueue:       workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[*eventData[*corev1.Pod]]()),
 		nqosNamespaceQueue: workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[*eventData[*corev1.Namespace]]()),
 	}
 	tb.Cleanup(c.nqosPodQueue.ShutDown)
+	tb.Cleanup(c.nqosQueue.ShutDown)
 	tb.Cleanup(c.nqosNamespaceQueue.ShutDown)
 	return c, indexer
 }
@@ -74,19 +76,21 @@ func TestEventsWithoutNetworkQoS(t *testing.T) {
 				}
 			}
 			check(0)
-			// The informer stores a policy before invoking its handler. Events
-			// must resume even before onNQOSAdd or the first reconcile runs.
+			// Policy notification must enable events before reconciliation.
 			if err := indexer.Add(policy); err != nil {
 				t.Fatal(err)
 			}
+			c.onNQOSAdd(policy)
 			check(1)
 			if err := indexer.Delete(policy); err != nil {
 				t.Fatal(err)
 			}
+			c.onNQOSDelete(policy)
 			check(0)
 			if err := indexer.Add(policy); err != nil {
 				t.Fatal(err)
 			}
+			c.onNQOSAdd(policy)
 			check(1)
 		})
 	}
@@ -112,6 +116,7 @@ func TestQueuedPodEventAfterLastNetworkQoSDeleted(t *testing.T) {
 	if err := indexer.Add(policy); err != nil {
 		t.Fatal(err)
 	}
+	c.onNQOSAdd(policy)
 	c.onNQOSPodDelete(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "deleted-ns"}})
 	if c.nqosPodQueue.Len() != 1 {
 		t.Fatal("expected a queued pod deletion")
@@ -139,6 +144,7 @@ func (failingNetworkQoSLister) List(labels.Selector) ([]*nqostype.NetworkQoS, er
 func TestNetworkQoSLookupErrorPreservesEvents(t *testing.T) {
 	c, _ := newEventTestController(t)
 	c.nqosLister = failingNetworkQoSLister{}
+	c.refreshNetworkQoSRelevance()
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "ns"}}
 	c.onNQOSPodAdd(pod)
 	c.onNQOSNamespaceAdd(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns"}})

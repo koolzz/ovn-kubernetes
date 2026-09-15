@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	nadinformerv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/client/informers/externalversions/k8s.cni.cncf.io/v1"
@@ -82,8 +83,15 @@ type Controller struct {
 	nqosPodSynced cache.InformerSynced
 	nqosPodQueue  workqueue.TypedRateLimitingInterface[*eventData[*corev1.Pod]]
 	// nad lister, only valid for default network controller when multi-network is enabled
-	nadLister nadlisterv1.NetworkAttachmentDefinitionLister
-	nadSynced cache.InformerSynced
+	nadLister   nadlisterv1.NetworkAttachmentDefinitionLister
+	nadSynced   cache.InformerSynced
+	nadInformer cache.SharedIndexInformer
+	nadHandler  cache.ResourceEventHandlerRegistration
+
+	// Serialize relevance refreshes from the independent policy, namespace,
+	// and NAD informers. Pod handlers only read the resulting flag.
+	relevanceMutex    sync.Mutex
+	hasRelevantPolicy atomic.Bool
 }
 
 type eventData[T metav1.Object] struct {
@@ -136,14 +144,22 @@ func NewController(
 	}
 
 	c := &Controller{
-		controllerName:    controllerName,
-		NetInfo:           netInfo,
-		networkManager:    networkManager,
-		nbClient:          nbClient,
-		nqosClientSet:     nqosClient,
-		addressSetFactory: addressSetFactory,
-		nodeName:          nodeName,
-		nqosCache:         syncmap.NewSyncMap[*networkQoSState](),
+		controllerName:      controllerName,
+		NetInfo:             netInfo,
+		networkManager:      networkManager,
+		nbClient:            nbClient,
+		nqosClientSet:       nqosClient,
+		addressSetFactory:   addressSetFactory,
+		nodeName:            nodeName,
+		nqosCache:           syncmap.NewSyncMap[*networkQoSState](),
+		nqosNamespaceLister: namespaceInformer.Lister(),
+	}
+	// These listers must be ready before registering handlers: an informer
+	// that is already running can deliver its initial events immediately.
+	if nadInformer != nil {
+		c.nadLister = nadInformer.Lister()
+		c.nadSynced = nadInformer.Informer().HasSynced
+		c.nadInformer = nadInformer.Informer()
 	}
 
 	klog.V(5).Infof("Setting up event handlers for Network QoS controller %s", controllerName)
@@ -164,7 +180,6 @@ func NewController(
 	}
 
 	klog.V(5).Info("Setting up event handlers for Namespaces in Network QoS controller")
-	c.nqosNamespaceLister = namespaceInformer.Lister()
 	c.nqosNamespaceSynced = namespaceInformer.Informer().HasSynced
 	c.nqosNamespaceQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
 		controllerutil.DefaultRateLimiter[*eventData[*corev1.Namespace]](),
@@ -195,10 +210,15 @@ func NewController(
 		return nil, fmt.Errorf("could not add Event Handler for pod Informer during network qos controller initialization, %w", err)
 	}
 
-	klog.V(5).Info("Setting up event handlers for Nodes in Network QoS controller")
 	if nadInformer != nil {
-		c.nadLister = nadInformer.Lister()
-		c.nadSynced = nadInformer.Informer().HasSynced
+		c.nadHandler, err = c.nadInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    c.onNQOSNADChange,
+			UpdateFunc: func(_, obj interface{}) { c.onNQOSNADChange(obj) },
+			DeleteFunc: c.onNQOSNADChange,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("could not add NetworkQoS NAD event handler: %w", err)
+		}
 	}
 
 	c.eventRecorder = recorder
@@ -209,6 +229,13 @@ func NewController(
 // objects (pods, namespaces, nqoses) will be handled in parallel.
 func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
+	if c.nadHandler != nil {
+		defer func() {
+			if err := c.nadInformer.RemoveEventHandler(c.nadHandler); err != nil {
+				utilruntime.HandleError(err)
+			}
+		}()
+	}
 
 	klog.Infof("Starting controller %s", c.controllerName)
 
@@ -306,6 +333,7 @@ func (c *Controller) onNQOSAdd(obj any) {
 		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %+v: %v", obj, err))
 		return
 	}
+	c.refreshNetworkQoSRelevance()
 	c.nqosQueue.Add(key)
 }
 
@@ -331,6 +359,7 @@ func (c *Controller) onNQOSUpdate(oldObj, newObj any) {
 	}
 	key, err := cache.MetaNamespaceKeyFunc(newObj)
 	if err == nil {
+		c.refreshNetworkQoSRelevance()
 		// updates to NQOS object should be very rare, once put in place they usually stay the same
 		klog.V(4).Infof("Updating Network QoS %s: nqosSpec %v",
 			key, newNQOS.Spec)
@@ -340,11 +369,12 @@ func (c *Controller) onNQOSUpdate(oldObj, newObj any) {
 
 // onNQOSDelete queues the NQOS for processing.
 func (c *Controller) onNQOSDelete(obj interface{}) {
-	key, err := cache.MetaNamespaceKeyFunc(obj)
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %+v: %v", obj, err))
 		return
 	}
+	c.refreshNetworkQoSRelevance()
 	c.nqosQueue.Add(key)
 }
 
@@ -362,6 +392,7 @@ func (c *Controller) onNQOSNamespaceAdd(obj interface{}) {
 		utilruntime.HandleError(fmt.Errorf("empty namespace"))
 		return
 	}
+	c.refreshNetworkQoSRelevance()
 	c.nqosNamespaceQueue.Add(newEventData(nil, ns))
 }
 
@@ -394,6 +425,7 @@ func (c *Controller) onNQOSNamespaceUpdate(oldObj, newObj interface{}) {
 		return
 	}
 	klog.V(5).Infof("Namespace %s labels have changed: %v", newNamespace.Name, newNamespaceLabels)
+	c.refreshNetworkQoSRelevance()
 	c.nqosNamespaceQueue.Add(newEventData(oldNamespace, newNamespace))
 }
 
@@ -416,13 +448,14 @@ func (c *Controller) onNQOSNamespaceDelete(obj interface{}) {
 		}
 	}
 	if ns != nil {
+		c.refreshNetworkQoSRelevance()
 		c.nqosNamespaceQueue.Add(newEventData(ns, nil))
 	}
 }
 
 // onNQOSPodAdd queues the pod for processing.
 func (c *Controller) onNQOSPodAdd(obj interface{}) {
-	if !c.hasNetworkQoS() {
+	if !c.hasRelevantPolicy.Load() {
 		return
 	}
 	pod, ok := obj.(*corev1.Pod)
@@ -439,7 +472,7 @@ func (c *Controller) onNQOSPodAdd(obj interface{}) {
 
 // onNQOSPodUpdate queues the pod for processing.
 func (c *Controller) onNQOSPodUpdate(oldObj, newObj interface{}) {
-	if !c.hasNetworkQoS() {
+	if !c.hasRelevantPolicy.Load() {
 		return
 	}
 	oldPod, ok := oldObj.(*corev1.Pod)
@@ -492,7 +525,7 @@ func (c *Controller) podNetworkResolver() func(nadKey string) string {
 
 // onNQOSPodDelete queues the pod for processing.
 func (c *Controller) onNQOSPodDelete(obj interface{}) {
-	if !c.hasNetworkQoS() {
+	if !c.hasRelevantPolicy.Load() {
 		return
 	}
 	pod, ok := obj.(*corev1.Pod)
