@@ -6,6 +6,7 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -15,6 +16,9 @@ import (
 
 	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/require"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	fakeexec "k8s.io/utils/exec/testing"
 	"k8s.io/utils/ptr"
@@ -1077,5 +1081,256 @@ func TestCheckPortsAllowNoUplink(t *testing.T) {
 	config.Gateway.AllowNoUplink = true
 	if err := checkPorts(nil, nil, "", ""); err != nil {
 		t.Fatalf("checkPorts with AllowNoUplink and empty physIntf: %v", err)
+	}
+}
+
+// Shared bridges carry both default-network traffic and UDN traffic. Unlike an
+// Uplink, losing one UDN must preserve the default network's static forwarding.
+func TestOpenFlowManagerRefreshesSharedPatchPort(t *testing.T) {
+	for _, external := range []bool{false, true} {
+		for _, fullRefresh := range []bool{false, true} {
+			t.Run(fmt.Sprintf("external=%t/full-refresh=%t", external, fullRefresh), func(t *testing.T) {
+				require.NoError(t, config.PrepareTestConfig())
+				t.Cleanup(func() { _ = config.PrepareTestConfig() })
+				config.IPv4Mode, config.IPv6Mode = true, true
+				config.Gateway.Mode = config.GatewayModeShared
+				config.Gateway.V4MasqueradeSubnet = "169.254.0.0/17"
+				config.Gateway.V6MasqueradeSubnet = "fd69::/112"
+				config.OVNKubernetesFeature.EnableMultiNetwork = true
+				config.OVNKubernetesFeature.EnableNetworkSegmentation = true
+
+				client, cleanup, err := libovsdbtest.NewOVSTestHarness(libovsdbtest.TestSetup{
+					OVSData: []libovsdbtest.TestData{
+						&vswitchd.OpenvSwitch{UUID: "root", Bridges: []string{"default", "external"}},
+						&vswitchd.Bridge{UUID: "default", Name: "breth0"},
+						&vswitchd.Bridge{UUID: "external", Name: "br0", ExternalIDs: map[string]string{"bridge-uplink": "eth1"}},
+					},
+				})
+				require.NoError(t, err)
+				t.Cleanup(cleanup.Cleanup)
+				fexec := ovntest.NewFakeExec()
+				require.NoError(t, util.SetExec(fexec))
+				t.Cleanup(util.ResetRunner)
+				t.Cleanup(util.SetProcSysNetForTesting(t.TempDir()))
+				ips := ovntest.MustParseIPNets("172.28.0.3/24", "fd28::3/64")
+				mac := ovntest.MustParseMAC("62:41:d0:54:3d:64")
+				defaultBridge := bridgeconfig.TestDefaultBridgeConfigWithOVSClient(client, ips, mac)
+				defaultPatch := "defaultpatch"
+				defaultBridge.GetNetworkConfig(types.DefaultNetworkName).PatchPort = defaultPatch
+				for name, port := range map[string]int{"eth0": 1, defaultPatch: 2} {
+					require.NoError(t, ops.CreateOrUpdateOVSPort(client, "breth0", name,
+						&vswitchd.Port{}, &vswitchd.Interface{Ofport: ptr.To(port)}))
+				}
+				require.NoError(t, defaultBridge.ConfigureBridgePorts())
+				ofm := &openflowManager{defaultBridge: newOpenflowBridge(defaultBridge), ovsClient: client}
+				bridge := ofm.defaultBridge
+				if external {
+					require.NoError(t, ops.CreateOrUpdateOVSPort(client, "br0", "eth1",
+						&vswitchd.Port{}, &vswitchd.Interface{Ofport: ptr.To(1)}))
+					bc, err := bridgeconfig.NewUnmanagedBridgeConfiguration(client, "br0", "br0", "node-a", "physnet-external", ips, mac, nil)
+					require.NoError(t, err)
+					require.NoError(t, bc.AddNetworkConfig(&util.DefaultNetInfo{}, nil, nil, 1, 0, nil, nil))
+					defaultPatch = (&util.DefaultNetInfo{}).GetNetworkScopedPatchPortName("br0", "node-a")
+					require.NoError(t, ops.CreateOrUpdateOVSPort(client, "br0", defaultPatch,
+						&vswitchd.Port{}, &vswitchd.Interface{Type: "patch", Ofport: ptr.To(2)}))
+					require.NoError(t, bc.ConfigureBridgePorts())
+					bridge = newOpenflowBridge(bc)
+					ofm.externalGatewayBridge = bridge
+				}
+				ni, err := util.ParseNADInfo(generateUplinkNAD("blue", "blue", "test",
+					types.Layer3Topology, "100.128.0.0/16/24,fd00:100::/48/64", types.NetworkRolePrimary, ""))
+				require.NoError(t, err)
+				v4, err := udn.AllocateV4MasqueradeIPs(3)
+				require.NoError(t, err)
+				v6, err := udn.AllocateV6MasqueradeIPs(3)
+				require.NoError(t, err)
+				require.NoError(t, bridge.AddNetworkConfig(ni, ovntest.MustParseIPNets("100.128.0.0/24", "fd00:100::/64"),
+					ovntest.MustParseIPNets("100.128.0.2/24", "fd00:100::2/64"), 4, 0x1001, v6, v4))
+				patch := bridge.GetNetworkConfig(ni.GetNetworkName()).PatchPort
+				require.NoError(t, ops.CreateOrUpdateOVSPort(client, bridge.GetBridgeName(), patch,
+					&vswitchd.Port{}, &vswitchd.Interface{Type: "patch", Ofport: ptr.To(6)}))
+				fexec.AddFakeCmd(&ovntest.ExpectedCmd{Cmd: "ovs-ofctl mod-port " + bridge.GetBridgeName() + " 6 no-flood"})
+				require.NoError(t, bridge.SetNetworkOfPatchPort(ni.GetNetworkName()))
+				require.NoError(t, ofm.updateBridgeFlowCache(nil, nil))
+				ofm.updateBridgePMTUDFlowCache("PMTUD_test", []string{"172.28.0.8", "fd28::8"})
+				require.Contains(t, strings.Join(bridge.getFlowsByKey("DEFAULT"), "\n"), "in_port=6,")
+				calls := 0
+				replayError := errors.New("service enqueue failed")
+				ofm.resyncServices = func() error {
+					calls++
+					require.True(t, ofm.staticFlowsMu.TryLock())
+					ofm.staticFlowsMu.Unlock()
+					return replayError
+				}
+				for _, tc := range []struct {
+					name    string
+					port    *int
+					missing bool
+					want    string
+				}{
+					{name: "renumbered", port: ptr.To(7), want: "7"},
+					{name: "unassigned"},
+					{name: "invalid", port: ptr.To(-1)},
+					{name: "ready again", port: ptr.To(8), want: "8"},
+					{name: "missing", missing: true},
+					{name: "recreated", port: ptr.To(9), want: "9"},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						bridge.updateFlowCacheEntry("stale-service", []string{"actions=output:6"})
+						bridge.updateGroupCacheEntry("stale-service", []string{"group_id=100,type=select,bucket=actions=output:6"})
+						if tc.missing {
+							require.NoError(t, ops.DeletePortWithInterfaces(client, bridge.GetBridgeName(), patch))
+							gomega.NewWithT(t).Eventually(func() error { _, err := ops.GetOVSInterface(client, patch); return err }, 3*time.Second, 10*time.Millisecond).Should(gomega.MatchError(libovsdbclient.ErrNotFound))
+						} else {
+							require.NoError(t, ops.CreateOrUpdateOVSPort(client, bridge.GetBridgeName(), patch,
+								&vswitchd.Port{}, &vswitchd.Interface{Type: "patch", Ofport: tc.port}))
+							iface, getErr := ops.GetOVSInterface(client, patch)
+							require.NoError(t, getErr)
+							iface.Ofport = tc.port
+							operations, updateErr := client.Where(iface).Update(iface, &iface.Ofport)
+							require.NoError(t, updateErr)
+							_, updateErr = ops.TransactAndCheck(client, operations)
+							require.NoError(t, updateErr)
+							gomega.NewWithT(t).Eventually(func(g gomega.Gomega) {
+								iface, err := ops.GetOVSInterface(client, patch)
+								g.Expect(err).NotTo(gomega.HaveOccurred())
+								g.Expect(iface.Ofport).To(gomega.Equal(tc.port))
+							}, 3*time.Second, 10*time.Millisecond).Should(gomega.Succeed())
+						}
+						_, err := ofm.refreshBridgeFlowCache(fullRefresh)
+						if replayError != nil {
+							require.ErrorIs(t, err, replayError)
+							replayError = nil
+							changed, retryErr := ofm.refreshBridgeFlowCache(fullRefresh)
+							require.NoError(t, retryErr)
+							require.True(t, changed)
+						} else {
+							require.NoError(t, err)
+						}
+						require.Equal(t, tc.want, bridge.GetNetworkConfig(ni.GetNetworkName()).OfPortPatch)
+						// Unassigned -> invalid is unchanged and must preserve current entries.
+						if tc.name != "invalid" {
+							require.Empty(t, bridge.getFlowsByKey("stale-service"))
+							require.Empty(t, bridge.getGroupsByKey("stale-service"))
+						}
+						flows := strings.Join(bridge.getFlowsByKey("DEFAULT"), "\n")
+						require.NotContains(t, flows, "in_port=6,")
+						require.NotContains(t, flows, "output:6")
+						require.Contains(t, flows, "in_port=2,")
+						require.Equal(t, "2", bridge.GetNetworkConfig(types.DefaultNetworkName).OfPortPatch)
+						if tc.want != "" {
+							require.Contains(t, flows, "in_port="+tc.want+",")
+							require.Contains(t, strings.Join(bridge.getFlowsByKey("PMTUD_test"), "\n"), "in_port="+tc.want+",")
+						}
+						fexec.AddFakeCmd(&ovntest.ExpectedCmd{Cmd: "ovs-ofctl dump-ports-desc " + bridge.GetBridgeName()})
+						if tc.want != "" {
+							fexec.AddFakeCmd(&ovntest.ExpectedCmd{Cmd: "ovs-ofctl mod-port " + bridge.GetBridgeName() + " " + tc.want + " no-flood"})
+						}
+						require.NoError(t, bridge.SyncNoFlood())
+						require.True(t, fexec.CalledMatchesExpected(), fexec.ErrorDesc())
+						// A missing UDN must not block the periodic recovery path.
+						nets, phys, port := bridge.GetPortConfigurations()
+						require.NoError(t, checkPorts(client, nets, phys, port))
+						previousCalls := calls
+						bridge.updateFlowCacheEntry("current-service", []string{"actions=output:2"})
+						changed, err := ofm.refreshBridgeFlowCache(fullRefresh)
+						require.NoError(t, err)
+						require.False(t, changed)
+						require.Equal(t, previousCalls, calls)
+						require.NotEmpty(t, bridge.getFlowsByKey("current-service"))
+					})
+				}
+				require.Equal(t, 6, calls)
+
+				setPort := func(port int) {
+					t.Helper()
+					iface, err := ops.GetOVSInterface(client, patch)
+					require.NoError(t, err)
+					iface.Ofport = ptr.To(port)
+					operations, err := client.Where(iface).Update(iface, &iface.Ofport)
+					require.NoError(t, err)
+					_, err = ops.TransactAndCheck(client, operations)
+					require.NoError(t, err)
+					gomega.NewWithT(t).Eventually(func() *int {
+						iface, err := ops.GetOVSInterface(client, patch)
+						require.NoError(t, err)
+						return iface.Ofport
+					}, 3*time.Second, 10*time.Millisecond).Should(gomega.Equal(ptr.To(port)))
+				}
+				t.Run("failed rebuild retries after caching new port", func(t *testing.T) {
+					setPort(10)
+					ipv6 := ips[1]
+					ips[1] = ips[0]
+					t.Cleanup(func() { ips[1] = ipv6 })
+					bridge.updateFlowCacheEntry("stale-service", []string{"actions=output:9"})
+					bridge.updateGroupCacheEntry("stale-service", []string{"group_id=100,type=select,bucket=actions=output:9"})
+					for range 2 {
+						_, err := ofm.refreshBridgeFlowCache(fullRefresh)
+						require.ErrorContains(t, err, "unable to determine IPv6 physical IP")
+						require.Equal(t, []string{"table=0,priority=0,actions=drop"}, bridge.getFlowsByKey("DEFAULT"))
+						require.Empty(t, bridge.getFlowsByKey("NORMAL"))
+						require.Empty(t, bridge.getFlowsByKey("stale-service"))
+						require.Empty(t, bridge.getGroupsByKey("stale-service"))
+						require.Equal(t, 6, calls)
+					}
+					ips[1] = ipv6
+					changed, err := ofm.refreshBridgeFlowCache(fullRefresh)
+					require.NoError(t, err)
+					require.True(t, changed)
+					require.Equal(t, 7, calls)
+					require.Contains(t, strings.Join(bridge.getFlowsByKey("DEFAULT"), "\n"), "in_port=10,")
+					require.NotEmpty(t, bridge.getFlowsByKey("NORMAL"))
+				})
+				if !external {
+					t.Run("in flight Service writer cannot restore stale port", func(t *testing.T) {
+						entered, release := make(chan struct{}), make(chan struct{})
+						var releaseOnce sync.Once
+						unblock := func() { releaseOnce.Do(func() { close(release) }) }
+						t.Cleanup(unblock)
+						fexec.AddFakeCmd(&ovntest.ExpectedCmd{Cmd: "ovs-ofctl show " + bridge.GetBridgeName(), Action: func() error {
+							close(entered)
+							<-release
+							return nil
+						}})
+						npw := &nodePortWatcher{ofm: ofm, gwBridge: bridge.BridgeConfiguration, ofportPhys: "1"}
+						service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "concurrent"},
+							Spec: corev1.ServiceSpec{ExternalIPs: []string{"192.0.2.1"}, Ports: []corev1.ServicePort{{Protocol: corev1.ProtocolTCP, Port: 80}}}}
+						writerDone := make(chan error, 1)
+						go func() { writerDone <- npw.updateServiceFlowCache(service, ni, true, false, nil) }()
+						select {
+						case <-entered:
+						case <-time.After(3 * time.Second):
+							t.Fatal("Service did not reach flow generation")
+						}
+						locked := ofm.staticFlowsMu.TryLock()
+						if locked {
+							ofm.staticFlowsMu.Unlock()
+						}
+						require.False(t, locked, "Service configuration snapshot must be protected until publication")
+						setPort(11)
+						refreshDone := make(chan error, 1)
+						go func() { _, err := ofm.refreshBridgeFlowCache(fullRefresh); refreshDone <- err }()
+						unblock()
+						select {
+						case err := <-writerDone:
+							require.NoError(t, err)
+						case <-time.After(3 * time.Second):
+							t.Fatal("Service writer deadlocked")
+						}
+						select {
+						case err := <-refreshDone:
+							require.NoError(t, err)
+						case <-time.After(3 * time.Second):
+							t.Fatal("patch recovery deadlocked")
+						}
+						require.NotContains(t, strings.Join(bridge.flows(), "\n"), "output:10")
+						require.Empty(t, bridge.getFlowsByKey("External_test_concurrent_192.0.2.1_80"))
+						require.NoError(t, npw.updateServiceFlowCache(&corev1.Service{ObjectMeta: service.ObjectMeta,
+							Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Protocol: corev1.ProtocolTCP, Port: 80, NodePort: 30080}}}}, ni, true, false, nil))
+						require.Contains(t, strings.Join(bridge.getFlowsByKey("NodePort_test_concurrent_tcp_30080"), "\n"), "output:11")
+					})
+				}
+			})
+		}
 	}
 }

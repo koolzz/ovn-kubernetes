@@ -69,8 +69,8 @@ type openflowManager struct {
 	staticFlowHostSubnets []*net.IPNet
 	pmtudFlowIPs          map[string][]string // protected by staticFlowsMu
 	// Only the Run loop refreshes patch ports and retries service resyncs.
-	uplinkServicesNeedResync bool
-	resyncServices           func() error
+	servicesNeedResync bool
+	resyncServices     func() error
 	// localnetPortChan coalesces OVSDB events that may change whether a managed
 	// bridge has a localnet topology patch port.
 	localnetPortChan chan struct{}
@@ -850,7 +850,7 @@ func (c *openflowManager) Run(stopChan <-chan struct{}, doneWg *sync.WaitGroup) 
 				// flows on every service update. Keep periodic checks independent
 				// of requests so a busy flow channel cannot postpone them.
 				if _, err := c.refreshBridgeFlowCache(false); err != nil {
-					klog.Errorf("Failed to recover uplink patch port flows: %v", err)
+					klog.Errorf("Failed to recover patch port flows: %v", err)
 				}
 				c.syncFlows()
 			case <-stopChan:
@@ -914,7 +914,7 @@ func (c *openflowManager) updateBridgeFlowCache(hostIPs []net.IP, hostSubnets []
 	return nil
 }
 
-// refreshBridgeFlowCache recovers changed Uplink patch ports. When
+// refreshBridgeFlowCache recovers changed UDN patch ports on every bridge. When
 // refreshStaticFlows is true, it also re-renders all static flows to follow
 // localnet port membership changes. Address-driven updates share the same
 // lock so a refresh cannot overwrite newer address information.
@@ -922,6 +922,9 @@ func (c *openflowManager) updateBridgeFlowCache(hostIPs []net.IP, hostSubnets []
 func (c *openflowManager) refreshBridgeFlowCache(refreshStaticFlows bool) (bool, error) {
 	c.staticFlowsMu.Lock()
 	changed, err := c.refreshUplinkBridgeFlowCacheLocked()
+	sharedChanged, sharedErr := c.refreshSharedBridgeFlowCacheLocked()
+	changed = changed || sharedChanged
+	err = errors.Join(err, sharedErr)
 	if err == nil && refreshStaticFlows && c.staticFlowsSet {
 		var staticChanged bool
 		staticChanged, err = c.updateBridgeFlowCacheLocked(c.staticFlowHostIPs, c.staticFlowHostSubnets)
@@ -934,14 +937,14 @@ func (c *openflowManager) refreshBridgeFlowCache(refreshStaticFlows bool) (bool,
 	// Service retry processing can update flow caches. Enqueue it without
 	// holding the static-flow or bridge locks, and retry on the next refresh
 	// if enqueueing fails after the new port numbers have already been stored.
-	if c.uplinkServicesNeedResync {
+	if c.servicesNeedResync {
 		changed = true
 		if c.resyncServices != nil {
 			if err := c.resyncServices(); err != nil {
-				return changed, fmt.Errorf("failed to resync services after uplink patch port change: %w", err)
+				return changed, fmt.Errorf("failed to resync services after patch port change: %w", err)
 			}
 		}
-		c.uplinkServicesNeedResync = false
+		c.servicesNeedResync = false
 	}
 	return changed, nil
 }
@@ -981,7 +984,7 @@ func (c *openflowManager) refreshUplinkBridgeFlowCacheLocked() (bool, error) {
 			bridge.patchFlowsNeedRefresh = true
 		}
 		if bridge.patchFlowsNeedRefresh {
-			c.uplinkServicesNeedResync = true
+			c.servicesNeedResync = true
 			// Build the full replacement before publishing it. Another bridge's
 			// refresh can fail, and flow requests can still sync this bridge.
 			flows, flowErr := bridge.UplinkBridgeFlows(c.staticFlowHostSubnets)
@@ -1008,6 +1011,53 @@ func (c *openflowManager) refreshUplinkBridgeFlowCacheLocked() (bool, error) {
 	c.uplinkBridgesMu.Lock()
 	c.portCheckFailed = failed
 	c.uplinkBridgesMu.Unlock()
+	return changed, errors.Join(errs...)
+}
+
+// The caller must hold staticFlowsMu, also held by Service flow generation.
+// Shared-bridge Service entries can contain outputs to several networks. Replace
+// that bridge's cache as a unit and replay Services after releasing the mutex.
+func (c *openflowManager) refreshSharedBridgeFlowCacheLocked() (bool, error) {
+	if !c.staticFlowsSet {
+		return false, nil
+	}
+	bridges := []*openflowBridge{c.defaultBridge}
+	if c.externalGatewayBridge != nil {
+		bridges = append(bridges, c.externalGatewayBridge)
+	}
+	changed := false
+	var errs []error
+	for _, bridge := range bridges {
+		portsChanged, err := bridge.RefreshUDNPatchPorts()
+		if portsChanged {
+			bridge.patchFlowsNeedRefresh = true
+		}
+		if bridge.patchFlowsNeedRefresh {
+			c.servicesNeedResync = true
+			var flows []string
+			var flowErr error
+			if bridge == c.defaultBridge {
+				flows, flowErr = bridge.DefaultBridgeFlows(c.staticFlowHostSubnets, c.staticFlowHostIPs)
+			} else {
+				flows, flowErr = bridge.ExternalBridgeFlows(c.staticFlowHostSubnets)
+			}
+			replacement := map[string][]string{"DEFAULT": {"table=0,priority=0,actions=drop"}}
+			if flowErr == nil {
+				replacement["NORMAL"] = []string{fmt.Sprintf("table=0,priority=0,actions=%s\n", util.NormalAction)}
+				replacement["DEFAULT"] = flows
+			}
+			for key, ips := range c.pmtudFlowIPs {
+				replacement[key] = bridge.PMTUDDropFlows(ips)
+			}
+			bridge.replaceFlowCache(replacement)
+			bridge.patchFlowsNeedRefresh = flowErr != nil
+			changed = true
+			err = errors.Join(err, flowErr)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to refresh patch ports on bridge %s: %w", bridge.GetBridgeName(), err))
+		}
+	}
 	return changed, errors.Join(errs...)
 }
 
@@ -1061,7 +1111,7 @@ func checkPorts(ovsClient libovsdbclient.Client, netConfigs []*bridgeconfig.Brid
 	// it could be that the ovn-controller recreated the patch between the host OVS bridge and
 	// the integration bridge, as a result the ofport number changed for that patch interface
 	for _, netConfig := range netConfigs {
-		if netConfig.OfPortPatch == "" {
+		if !netConfig.IsDefaultNetwork() || netConfig.OfPortPatch == "" {
 			continue
 		}
 		curOfportPatch, err := ovsops.GetOVSInterfaceOfPort(ovsClient, netConfig.PatchPort, true)
@@ -1069,13 +1119,9 @@ func checkPorts(ovsClient libovsdbclient.Client, netConfigs []*bridgeconfig.Brid
 			return fmt.Errorf("failed to get ofport of %s: %w", netConfig.PatchPort, err)
 		}
 		if netConfig.OfPortPatch != curOfportPatch {
-			if netConfig.IsDefaultNetwork() {
-				klog.Errorf("Fatal error: patch port %s ofport changed from %s to %s",
-					netConfig.PatchPort, netConfig.OfPortPatch, curOfportPatch)
-				os.Exit(1)
-			} else {
-				klog.Warningf("UDN patch port %s changed for existing network from %v to %v. Expecting bridge config update.", netConfig.PatchPort, netConfig.OfPortPatch, curOfportPatch)
-			}
+			klog.Errorf("Fatal error: patch port %s ofport changed from %s to %s",
+				netConfig.PatchPort, netConfig.OfPortPatch, curOfportPatch)
+			os.Exit(1)
 		}
 	}
 	return checkPhysicalPort(ovsClient, physIntf, ofPortPhys)

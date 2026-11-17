@@ -263,6 +263,11 @@ func (npw *nodePortWatcher) updateGatewayIPs() {
 // `hasLocalHostNetworkEp` indicates if at least one host networked endpoint exists for this service which is local to this node.
 func (npw *nodePortWatcher) updateServiceFlowCache(service *corev1.Service, netInfo util.NetInfo, add,
 	hasLocalHostNetworkEp bool, localEndpoints util.PortToLBEndpoints) error {
+	// Serialize snapshot-to-publication with patch-port replacement, or an
+	// in-flight writer could restore flows/groups using a recycled ofport.
+	npw.ofm.staticFlowsMu.Lock()
+	defer npw.ofm.staticFlowsMu.Unlock()
+
 	if config.Gateway.Mode == config.GatewayModeLocal && config.Gateway.AllowNoUplink && npw.ofportPhys == "" {
 		// if LGW mode and no uplink gateway bridge, ingress traffic enters host from node physical interface instead of the breth0. Skip adding these service flows to br-ex.
 		return nil
