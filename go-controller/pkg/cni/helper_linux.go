@@ -829,7 +829,7 @@ func ConfigureOVS(ctx context.Context, ovsClient client.Client, namespace, podNa
 		// representor lock while waiting for OVN to install flows.
 		release()
 	}
-	if err := waitForPodInterface(ctx, ovsClient, ifInfo, hostIfaceName, ifaceID, getter,
+	if err := waitForPodInterface(ctx, ovsClient, ifInfo, hostIfaceName, ifaceID, sandboxID, getter,
 		namespace, podName, initialPodUID); err != nil {
 		// Ensure the error shows up in node logs, rather than just
 		// being reported back to the runtime.

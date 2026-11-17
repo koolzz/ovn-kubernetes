@@ -15,6 +15,7 @@ import (
 	"github.com/ovn-kubernetes/libovsdb/client"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb"
+	ovsops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/vswitchd"
@@ -61,7 +62,7 @@ func checkCancelSandbox(mac string, getter PodInfoGetter, namespace, name, nadKe
 }
 
 func waitForPodInterface(ctx context.Context, ovsClient client.Client, ifInfo *PodInterfaceInfo,
-	ifaceName, ifaceID string, getter PodInfoGetter,
+	ifaceName, ifaceID, sandboxID string, getter PodInfoGetter,
 	namespace, name, initialPodUID string) error {
 	const (
 		initialPollInterval = 2 * time.Millisecond
@@ -89,25 +90,24 @@ func waitForPodInterface(ctx context.Context, ovsClient client.Client, ifInfo *P
 			}
 			return fmt.Errorf("%s waiting for OVS port binding (ovn-installed) for %s %v", errDetail, mac, ifAddrs)
 		default:
-			// check to see if the interface has its expected external id set, which indicates if it is active
-			existingIfaceID := ""
-			ovnInstalled := ""
 			iface := &vswitchd.Interface{Name: ifaceName}
 			err := ovsClient.Get(ctx, iface)
-			if err != nil {
-				if !errors.Is(err, client.ErrNotFound) {
-					return fmt.Errorf("failed to get OVS interface %s while waiting for binding: %w", ifaceName, err)
+			if err != nil && !errors.Is(err, client.ErrNotFound) {
+				return fmt.Errorf("failed to get OVS interface %s while waiting for binding: %w", ifaceName, err)
+			}
+			if err != nil || iface.ExternalIDs["iface-id"] != ifaceID || iface.ExternalIDs["sandbox"] != sandboxID {
+				// Port creation committed before this wait, but its monitor update
+				// may lag. Confirm ownership in OVS before ending an obsolete ADD;
+				// another sandbox of the same Pod has the same logical iface-id.
+				iface, err = ovsops.GetOVSInterfaceFromDB(ctx, ovsClient, ifaceName)
+				if err != nil && !errors.Is(err, client.ErrNotFound) {
+					return fmt.Errorf("failed to verify OVS interface %s while waiting for binding: %w", ifaceName, err)
 				}
-			} else {
-				existingIfaceID = iface.ExternalIDs["iface-id"]
-				ovnInstalled = iface.ExternalIDs["ovn-installed"]
+				if err != nil || iface.ExternalIDs["iface-id"] != ifaceID || iface.ExternalIDs["sandbox"] != sandboxID {
+					return fmt.Errorf("OVS sandbox port %s is no longer active (probably due to DEL or a subsequent CNI ADD)", ifaceName)
+				}
 			}
-			// It may have been cleared by a subsequent CNI ADD and if so, there's no need to keep checking for flows
-			if existingIfaceID != "" && existingIfaceID != ifaceID {
-				return fmt.Errorf("OVS sandbox port %s is no longer active (probably due to a subsequent "+
-					"CNI ADD)", ifaceName)
-			}
-			if ovnInstalled == "true" {
+			if iface.ExternalIDs["ovn-installed"] == "true" {
 				klog.V(5).Infof("Interface %s has ovn-installed=true", ifaceName)
 				return nil
 			}

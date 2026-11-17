@@ -314,7 +314,7 @@ func TestShimOVSPortLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	_, err = ovsops.TransactAndCheck(serverClient, ops)
 	require.NoError(t, err)
-	require.NoError(t, waitForPodInterface(ctx, c, &PodInterfaceInfo{}, "pod-port", "ns_pod", nil, "ns", "pod", "uid"))
+	require.NoError(t, waitForPodInterface(ctx, c, &PodInterfaceInfo{}, "pod-port", "ns_pod", "sandbox", nil, "ns", "pod", "uid"))
 
 	require.NoError(t, setPodBandwidthForTest(c, "sandbox", "pod-port", 10_000_000, 2_000_000))
 	require.Eventually(t, func() bool {
@@ -447,13 +447,13 @@ func TestShimOVSWaitForBinding(t *testing.T) {
 				&vswitchd.Bridge{UUID: "br_int", Name: "br-int", Ports: []string{"port"}},
 				&vswitchd.Port{UUID: "port", Name: "pod-port", Interfaces: []string{"iface"}},
 				&vswitchd.Interface{UUID: "iface", Name: "pod-port", ExternalIDs: map[string]string{
-					"iface-id": tc.ifaceID, "ovn-installed": tc.installed,
+					"iface-id": tc.ifaceID, "sandbox": "sandbox", "ovn-installed": tc.installed,
 				}},
 			})
 			c := newShimOVSClientForTest(t, server, CNIAdd)
 			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
-			err := waitForPodInterface(ctx, c, &PodInterfaceInfo{}, "pod-port", "ns_pod", nil, "ns", "pod", "uid")
+			err := waitForPodInterface(ctx, c, &PodInterfaceInfo{}, "pod-port", "ns_pod", "sandbox", nil, "ns", "pod", "uid")
 			if tc.wantErr != "" {
 				require.ErrorContains(t, err, tc.wantErr)
 			} else {
@@ -510,8 +510,8 @@ func (g *shimReadinessPodGetter) getPod(_, _ string) (*corev1.Pod, error) {
 }
 
 func TestShimOVSConfigureStillWaitsForBinding(t *testing.T) {
-	for _, cancelBeforeReady := range []bool{false, true} {
-		t.Run(fmt.Sprintf("cancel=%t", cancelBeforeReady), func(t *testing.T) {
+	for _, outcome := range []string{"ready", "cancel", "replacement"} {
+		t.Run(outcome, func(t *testing.T) {
 			server, _ := newShimOVSTestServer(t, []libovsdbtest.TestData{
 				&vswitchd.OpenvSwitch{UUID: "ovs", Bridges: []string{"br_int"}, NextCfg: 7, CurCfg: 6},
 				&vswitchd.Bridge{UUID: "br_int", Name: "br-int"},
@@ -555,10 +555,14 @@ func TestShimOVSConfigureStillWaitsForBinding(t *testing.T) {
 				t.Fatalf("ConfigureOVS returned before OVN readiness: %v", err)
 			default:
 			}
-			if cancelBeforeReady {
+			if outcome == "cancel" {
 				cancel()
 			} else {
 				iface.ExternalIDs["ovn-installed"] = "true"
+				if outcome == "replacement" {
+					// Same Pod UID, logical port and allocation; only SandboxID changes.
+					iface.ExternalIDs["sandbox"] = "replacement"
+				}
 				ops, err := server.Where(&vswitchd.Interface{UUID: iface.UUID}).Update(iface, &iface.ExternalIDs)
 				require.NoError(t, err)
 				_, err = ovsops.TransactAndCheck(server, ops)
@@ -566,8 +570,17 @@ func TestShimOVSConfigureStillWaitsForBinding(t *testing.T) {
 			}
 			select {
 			case err := <-done:
-				if cancelBeforeReady {
+				if outcome == "cancel" {
 					require.ErrorContains(t, err, "canceled while waiting for OVS port binding")
+				} else if outcome == "replacement" {
+					require.ErrorContains(t, err, "no longer active")
+					oldRequest := &PodRequest{Command: CNIAdd, SandboxID: "sandbox", netName: types.DefaultNetworkName,
+						nadKey: types.DefaultNetworkName, CNIConf: &ovncnitypes.NetConf{}}
+					oldRequest.deletePort(c, "pod-port", "ns", "pod")
+					surviving, lookupErr := ovsops.GetOVSInterfaceFromDB(ctx, server, "pod-port")
+					require.NoError(t, lookupErr)
+					require.Equal(t, "replacement", surviving.ExternalIDs["sandbox"])
+					require.Equal(t, "true", surviving.ExternalIDs["ovn-installed"])
 				} else {
 					require.NoError(t, err)
 				}
@@ -603,7 +616,7 @@ func TestShimOVSInterfaceNotifications(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, addOrUpdatePodPort(ctx, server, "pod-port", map[string]string{"iface-id": "ns_pod"}, false, 1400, false))
+	require.NoError(t, addOrUpdatePodPort(ctx, server, "pod-port", map[string]string{"iface-id": "ns_pod", "sandbox": "sandbox"}, false, 1400, false))
 	waitForChange(changes)
 	iface, err := ovsops.GetOVSInterface(c, "pod-port")
 	require.NoError(t, err, "the cache must be updated before the callback")
@@ -613,7 +626,7 @@ func TestShimOVSInterfaceNotifications(t *testing.T) {
 	_, err = ovsops.TransactAndCheck(server, ops)
 	require.NoError(t, err)
 	waitForChange(changes)
-	require.NoError(t, waitForPodInterface(ctx, c, &PodInterfaceInfo{}, "pod-port", "ns_pod", nil, "ns", "pod", "uid"))
+	require.NoError(t, waitForPodInterface(ctx, c, &PodInterfaceInfo{}, "pod-port", "ns_pod", "sandbox", nil, "ns", "pod", "uid"))
 
 	// A ready interface reassigned to another sandbox must wake the old waiter.
 	iface.ExternalIDs["iface-id"] = "ns_other"
@@ -622,7 +635,7 @@ func TestShimOVSInterfaceNotifications(t *testing.T) {
 	_, err = ovsops.TransactAndCheck(server, ops)
 	require.NoError(t, err)
 	waitForChange(changes)
-	err = waitForPodInterface(ctx, c, &PodInterfaceInfo{}, "pod-port", "ns_pod", nil, "ns", "pod", "uid")
+	err = waitForPodInterface(ctx, c, &PodInterfaceInfo{}, "pod-port", "ns_pod", "sandbox", nil, "ns", "pod", "uid")
 	require.ErrorContains(t, err, "no longer active")
 
 	require.NoError(t, ovsops.DeleteMultiplePortsWithInterfaces(server, "br-int", "pod-port"))
@@ -781,4 +794,63 @@ func TestRepresentorDeleteWaitsForOwnerAndRefreshesCache(t *testing.T) {
 	require.Equal(t, "new", retained.ExternalIDs["sandbox"])
 	netlinkOps.AssertNotCalled(t, "LinkByName", mock.Anything)
 	netlinkOps.AssertNotCalled(t, "LinkSetDown", mock.Anything)
+}
+
+// A replacement sandbox keeps the same Pod UID and logical iface-id. Binding
+// readiness belongs to the sandbox, while a monitor miss may only be cache lag.
+func TestWaitForPodInterfaceSandboxOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name                             string
+		cached, actual                   map[string]string
+		cacheMissing, dbMissing, initial bool
+		wantErr                          string
+	}{
+		{name: "replacement sandbox with same pod identity", cached: map[string]string{"iface-id": "ns_pod", "sandbox": "replacement", "ovn-installed": "true"}, actual: map[string]string{"iface-id": "ns_pod", "sandbox": "replacement", "ovn-installed": "true"}, wantErr: "no longer active"},
+		{name: "DEL removed the waiting port", cacheMissing: true, dbMissing: true, wantErr: "no longer active"},
+		{name: "missing sandbox is not readiness", cached: map[string]string{"iface-id": "ns_pod", "ovn-installed": "true"}, actual: map[string]string{"iface-id": "ns_pod", "ovn-installed": "true"}, wantErr: "no longer active"},
+		{name: "cleared logical identity is not readiness", cached: map[string]string{"sandbox": "sandbox", "ovn-installed": "true"}, actual: map[string]string{"sandbox": "sandbox", "ovn-installed": "true"}, wantErr: "no longer active"},
+		{name: "initial monitor miss", initial: true, cacheMissing: true, actual: map[string]string{"iface-id": "ns_pod", "sandbox": "sandbox", "ovn-installed": "true"}},
+		{name: "stale owner in monitor", cached: map[string]string{"iface-id": "ns_pod", "sandbox": "previous", "ovn-installed": "true"}, actual: map[string]string{"iface-id": "ns_pod", "sandbox": "sandbox", "ovn-installed": "true"}},
+		{name: "stale logical identity in monitor", cached: map[string]string{"iface-id": "ns_previous", "sandbox": "previous", "ovn-installed": "true"}, actual: map[string]string{"iface-id": "ns_pod", "sandbox": "sandbox", "ovn-installed": "true"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []libovsdbtest.TestData{&vswitchd.OpenvSwitch{UUID: "ovs", Bridges: []string{"bridge"}}, &vswitchd.Bridge{UUID: "bridge", Name: "br-int"}}
+			if !tc.dbMissing {
+				data[1].(*vswitchd.Bridge).Ports = []string{"port"}
+				data = append(data, &vswitchd.Port{UUID: "port", Name: "pod-port", Interfaces: []string{"iface"}}, &vswitchd.Interface{UUID: "iface", Name: "pod-port", ExternalIDs: tc.actual})
+			}
+			server, _ := newShimOVSTestServer(t, data)
+			c := newShimOVSClientForTest(t, server, CNIAdd)
+			reads := 0
+			snapshot := &bindingOVSClient{Client: c, get: func(_ context.Context, row model.Model) error {
+				reads++
+				if reads == 1 && !tc.initial {
+					// Establish a pending binding before the DEL/takeover/cache miss.
+					row.(*vswitchd.Interface).ExternalIDs = map[string]string{"iface-id": "ns_pod", "sandbox": "sandbox"}
+					return nil
+				}
+				if tc.cacheMissing {
+					return client.ErrNotFound
+				}
+				row.(*vswitchd.Interface).ExternalIDs = tc.cached
+				return nil
+			}}
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			err := waitForPodInterface(ctx, snapshot, &PodInterfaceInfo{}, "pod-port", "ns_pod", "sandbox", nil, "ns", "pod", "uid")
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			// Ownership loss must end the ADD, not consume its whole binding timeout.
+			require.LessOrEqual(t, reads, 2)
+			require.Equal(t, 1, snapshot.dbReads, "confirm obsolete or stale cache entries once in OVS")
+			if !tc.dbMissing {
+				iface, err := ovsops.GetOVSInterface(server, "pod-port")
+				require.NoError(t, err)
+				require.Equal(t, tc.actual, iface.ExternalIDs, "waiting must not change the replacement's port")
+			}
+		})
+	}
 }

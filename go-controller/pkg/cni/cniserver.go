@@ -276,10 +276,9 @@ func (s *Server) handleCNIRequest(r *http.Request) (result []byte, err error) {
 	if err := json.Unmarshal(b, &cr); err != nil {
 		return nil, err
 	}
-	// containerd terminates the CNI shim when its sandbox request is canceled,
-	// which closes the connection and cancels r.Context(). CRI-O may keep CNI
-	// setup running under an independent timeout, so cmdAdd also detects Pod
-	// deletion and replacement explicitly.
+	// Cancellation follows the shim's HTTP connection. With chained plugins,
+	// a runtime timeout can leave a descendant holding that connection open.
+	// Bound the request here; cmdAdd also checks Pod deletion and replacement.
 	ctx, cancel := context.WithTimeout(r.Context(), kubeletDefaultCRIOperationTimeout)
 	defer cancel()
 

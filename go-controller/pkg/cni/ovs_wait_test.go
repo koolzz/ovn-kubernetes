@@ -19,6 +19,7 @@ import (
 
 	"github.com/ovn-kubernetes/libovsdb/client"
 	"github.com/ovn-kubernetes/libovsdb/model"
+	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
@@ -27,12 +28,53 @@ import (
 
 type bindingOVSClient struct {
 	client.Client
-	get   func(context.Context, model.Model) error
-	watch func(string) (<-chan struct{}, func())
+	get      func(context.Context, model.Model) error
+	watch    func(string) (<-chan struct{}, func())
+	readDB   func(context.Context, model.Model) error
+	selected *vswitchd.Interface
+	dbReads  int
 }
 
 func (c *bindingOVSClient) Get(ctx context.Context, row model.Model) error {
 	return c.get(ctx, row)
+}
+
+// Script database reads separately when a test models monitor lag. Other
+// scripted snapshots describe both views; OVSDB-backed tests delegate normally.
+func (c *bindingOVSClient) Select(m model.Model, fields ...any) ([]ovsdb.Operation, error) {
+	if c.Client != nil {
+		return c.Client.Select(m, fields...)
+	}
+	return []ovsdb.Operation{{Op: ovsdb.OperationSelect, Table: vswitchd.InterfaceTable}}, nil
+}
+func (c *bindingOVSClient) Transact(ctx context.Context, operations ...ovsdb.Operation) ([]ovsdb.OperationResult, error) {
+	c.dbReads++
+	if c.Client != nil {
+		return c.Client.Transact(ctx, operations...)
+	}
+	iface := &vswitchd.Interface{Name: operations[0].Where[0].Value.(string)}
+	get := c.get
+	if c.readDB != nil {
+		get = c.readDB
+	}
+	err := get(ctx, iface)
+	if err != nil && err != client.ErrNotFound {
+		return nil, err
+	}
+	c.selected = iface
+	if err == client.ErrNotFound {
+		c.selected = nil
+	}
+	return []ovsdb.OperationResult{{}}, nil
+}
+func (c *bindingOVSClient) GetSelectResults(operations []ovsdb.Operation, results []ovsdb.OperationResult, target interface{}) error {
+	if c.Client != nil {
+		return c.Client.GetSelectResults(operations, results, target)
+	}
+	if c.selected != nil {
+		*target.(*[]*vswitchd.Interface) = []*vswitchd.Interface{c.selected}
+	}
+	return nil
 }
 
 func (c *bindingOVSClient) WatchOVSInterface(name string) (<-chan struct{}, func()) {
@@ -95,19 +137,30 @@ func TestWaitForPodInterfacePolling(t *testing.T) {
 					}
 					iface := row.(*vswitchd.Interface)
 					require.Equal(t, "pod-port", iface.Name)
-					iface.ExternalIDs = map[string]string{"iface-id": "ns_pod"}
+					iface.ExternalIDs = map[string]string{"iface-id": "ns_pod", "sandbox": "sandbox"}
 					if tc.readyAfter >= 0 && time.Since(start) >= tc.readyAfter {
 						iface.ExternalIDs["ovn-installed"] = "true"
 					}
 					return nil
 				}}
+
+				if tc.initiallyMissing {
+					c.readDB = func(_ context.Context, row model.Model) error {
+						iface := row.(*vswitchd.Interface)
+						iface.ExternalIDs = map[string]string{"iface-id": "ns_pod", "sandbox": "sandbox"}
+						if time.Since(start) >= tc.readyAfter {
+							iface.ExternalIDs["ovn-installed"] = "true"
+						}
+						return nil
+					}
+				}
 				info, pod := bindingPod(t)
 				var podChecks []time.Duration
 				getter := bindingPodGetter(func() (*corev1.Pod, error) {
 					podChecks = append(podChecks, time.Since(start))
 					return pod, nil
 				})
-				err := waitForPodInterface(ctx, c, info, "pod-port", "ns_pod", getter, "ns", "pod", "uid")
+				err := waitForPodInterface(ctx, c, info, "pod-port", "ns_pod", "sandbox", getter, "ns", "pod", "uid")
 				if tc.wantErr != "" {
 					require.ErrorContains(t, err, tc.wantErr)
 				} else {
@@ -119,6 +172,9 @@ func TestWaitForPodInterfacePolling(t *testing.T) {
 					require.Equal(t, time.Duration(i)*200*time.Millisecond, elapsed)
 				}
 				require.LessOrEqual(t, reads, 12, "long waits must back off their cache polling")
+				if !tc.initiallyMissing {
+					require.Zero(t, c.dbReads, "ordinary binding waits must use the cache")
+				}
 			})
 		})
 	}
@@ -140,7 +196,7 @@ func TestWaitForPodInterfaceInvalidated(t *testing.T) {
 				defer cancel()
 				c := &bindingOVSClient{get: func(_ context.Context, row model.Model) error {
 					iface := row.(*vswitchd.Interface)
-					iface.ExternalIDs = map[string]string{"iface-id": "ns_pod"}
+					iface.ExternalIDs = map[string]string{"iface-id": "ns_pod", "sandbox": "sandbox"}
 					if tc.name == "interface replaced" && time.Since(start) >= 3*time.Millisecond {
 						iface.ExternalIDs = map[string]string{"iface-id": "ns_other", "ovn-installed": "true"}
 					}
@@ -164,7 +220,7 @@ func TestWaitForPodInterfaceInvalidated(t *testing.T) {
 					}
 					return pod, nil
 				})
-				err := waitForPodInterface(ctx, c, info, "pod-port", "ns_pod", getter, "ns", "pod", "uid")
+				err := waitForPodInterface(ctx, c, info, "pod-port", "ns_pod", "sandbox", getter, "ns", "pod", "uid")
 				require.ErrorContains(t, err, tc.wantErr)
 				require.LessOrEqual(t, time.Since(start), 200*time.Millisecond)
 			})
@@ -242,7 +298,7 @@ func TestWaitForPodInterfaceNotifications(t *testing.T) {
 					get: func(_ context.Context, row model.Model) error {
 						require.True(t, registered, "subscribe before the first cache read")
 						iface := row.(*vswitchd.Interface)
-						iface.ExternalIDs = map[string]string{"iface-id": "ns_pod"}
+						iface.ExternalIDs = map[string]string{"iface-id": "ns_pod", "sandbox": "sandbox"}
 						if ready || (!tc.duringRead && time.Since(start) >= tc.readyAfter) {
 							iface.ExternalIDs["ovn-installed"] = "true"
 							if tc.replaced {
@@ -264,7 +320,7 @@ func TestWaitForPodInterfaceNotifications(t *testing.T) {
 					podChecks = append(podChecks, time.Since(start))
 					return pod, nil
 				})
-				err := waitForPodInterface(ctx, c, info, "pod-port", "ns_pod", getter, "ns", "pod", "uid")
+				err := waitForPodInterface(ctx, c, info, "pod-port", "ns_pod", "sandbox", getter, "ns", "pod", "uid")
 				if tc.wantErr != "" {
 					require.ErrorContains(t, err, tc.wantErr)
 				} else {
