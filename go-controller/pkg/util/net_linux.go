@@ -269,7 +269,43 @@ func (defaultNetLinkOps) RouteListFiltered(family int, filter *netlink.Route, fi
 }
 
 func (defaultNetLinkOps) RouteListFilteredIter(family int, filter *netlink.Route, filterMask uint64, f func(netlink.Route) bool) error {
-	return netlink.RouteListFilteredIter(family, filter, filterMask, f)
+	// Route import only filters by BGP protocol and table. Other request fields
+	// (notably exact destinations/gateways) are not valid strict dump filters.
+	if (family != netlink.FAMILY_ALL && family != netlink.FAMILY_V4 && family != netlink.FAMILY_V6) ||
+		filter == nil || filter.Table <= 0 || filter.Protocol != unix.RTPROT_BGP ||
+		filterMask != netlink.RT_FILTER_TABLE|netlink.RT_FILTER_PROTOCOL ||
+		!reflect.DeepEqual(filter, &netlink.Route{Table: filter.Table, Protocol: filter.Protocol}) {
+		return netlink.RouteListFilteredIter(family, filter, filterMask, f)
+	}
+	h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
+	if err != nil {
+		return netlink.RouteListFilteredIter(family, filter, filterMask, f)
+	}
+	defer h.Close()
+	// Keep strict checking off the shared/package handles: other route lookups
+	// rely on non-strict semantics, and older kernels lack this socket option.
+	if err := h.SetStrictCheck(true); err != nil {
+		// Fallback must not require a second descriptor on older kernels.
+		_ = h.Close()
+		return netlink.RouteListFilteredIter(family, filter, filterMask, f)
+	}
+	delivered := false
+	err = h.RouteListFilteredIter(family, filter, filterMask, func(route netlink.Route) bool {
+		delivered = true
+		return f(route)
+	})
+	if !delivered {
+		// Non-strict dumps report a missing table as an empty result.
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP) {
+			_ = h.Close()
+			return netlink.RouteListFilteredIter(family, filter, filterMask, f)
+		}
+	}
+	// Never replay callbacks or hide an interrupted/partial dump.
+	return err
 }
 
 func (defaultNetLinkOps) RuleListFiltered(family int, filter *netlink.Rule, filterMask uint64) ([]netlink.Rule, error) {
