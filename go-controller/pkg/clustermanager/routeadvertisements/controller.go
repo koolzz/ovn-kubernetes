@@ -2406,7 +2406,7 @@ func nadNeedsUpdate(oldObj, newObj *nadtypes.NetworkAttachmentDefinition) bool {
 		if nad == nil {
 			return false
 		}
-		network, err := util.ParseNADInfo(newObj)
+		network, err := util.ParseNADInfo(nad)
 		if err != nil {
 			return true
 		}

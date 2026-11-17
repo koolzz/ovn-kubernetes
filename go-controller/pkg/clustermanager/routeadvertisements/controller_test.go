@@ -4421,6 +4421,23 @@ func TestUpdates(t *testing.T) {
 			newObject: &testNAD{Name: "net", Namespace: "net", Network: "net", IsSecondary: true, Topology: "layer3", Labels: map[string]string{"select": "2"}},
 		},
 		{
+			name:              "reconciles all RAs when a selected NAD becomes secondary",
+			oldObject:         &testNAD{Name: "net", Namespace: "net", Network: "net", Topology: "layer3", Subnet: "10.128.0.0/16/24", Labels: map[string]string{"select": "1"}},
+			newObject:         &testNAD{Name: "net", Namespace: "net", Network: "net", Topology: "layer3", Subnet: "10.128.0.0/16/24", IsSecondary: true, Labels: map[string]string{"select": "2"}},
+			expectedReconcile: []string{"ra1", "ra2", "ra3"},
+		},
+		{
+			name:              "reconciles all RAs when a secondary NAD becomes primary",
+			oldObject:         &testNAD{Name: "net", Namespace: "net", Network: "net", Topology: "layer3", Subnet: "10.128.0.0/16/24", IsSecondary: true, Labels: map[string]string{"select": "1"}},
+			newObject:         &testNAD{Name: "net", Namespace: "net", Network: "net", Topology: "layer3", Subnet: "10.128.0.0/16/24", Labels: map[string]string{"select": "2"}},
+			expectedReconcile: []string{"ra1", "ra2", "ra3"},
+		},
+		{
+			name:      "ignores label changes between unsupported secondary NADs",
+			oldObject: &testNAD{Name: "net", Namespace: "net", Network: "net", Topology: "layer3", Subnet: "10.128.0.0/16/24", IsSecondary: true, Labels: map[string]string{"select": "1"}},
+			newObject: &testNAD{Name: "net", Namespace: "net", Network: "net", Topology: "layer3", Subnet: "10.128.0.0/16/24", IsSecondary: true, Labels: map[string]string{"select": "2"}},
+		},
+		{
 			name:              "reconciles all RAs that advertise EIPs on new EIP with status",
 			newObject:         &testEIP{Name: "eip", EIPs: map[string]string{"node": "ip"}},
 			expectedReconcile: []string{"ra1", "ra3"},
@@ -4563,6 +4580,10 @@ func TestUpdates(t *testing.T) {
 			config.OVNKubernetesFeature.EnableRouteAdvertisements = true
 			config.OVNKubernetesFeature.EnableEgressIP = true
 			config.OVNKubernetesFeature.EnableEVPN = true
+			// Generated FRR configs participate in EVPN only in local gateway mode.
+			oldGatewayMode := config.Gateway.Mode
+			config.Gateway.Mode = config.GatewayModeLocal
+			defer func() { config.Gateway.Mode = oldGatewayMode }()
 
 			fakeClientset := util.GetOVNClientset().GetClusterManagerClientset()
 
