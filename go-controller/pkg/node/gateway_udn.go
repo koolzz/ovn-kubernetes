@@ -52,6 +52,9 @@ import (
 )
 
 const (
+	// Each gateway owns its queue. Network names are nonempty, so reserve the
+	// empty key for allocation checks that need no advertisement replay.
+	udnGatewayLocalNodeReconcileKey = ""
 	// ctMarkUDNBase is the conntrack mark base value for user defined networks to use
 	// Each network gets its own mark == base + network-id
 	ctMarkUDNBase = 3
@@ -121,7 +124,14 @@ type UserDefinedNetworkGateway struct {
 	// nextHops holds the default route next hops for this UDN gateway.
 	nextHops []net.IP
 
-	// gatewayReconciler is fed advertised-state changes by the network manager.
+	// localSubnets is the allocation used by the current programming attempt.
+	// subnetRefreshPending retains cleanup ownership across failed replacements,
+	// even if a later Node update changes back to the old allocation.
+	// Both are protected by operationMutex.
+	localSubnets         []*net.IPNet
+	subnetRefreshPending bool
+
+	// gatewayReconciler is fed local-Node and advertisement changes by the network manager.
 	// It coalesces events and retries until the latest configuration converges.
 	gatewayReconciler controllerutil.Reconciler
 
@@ -652,6 +662,10 @@ func (udng *UserDefinedNetworkGateway) addNetworkWithResolvedUplink(
 			udng.GetNetworkName(), err)
 	}
 
+	if udng.TopologyType() == types.Layer3Topology {
+		udng.localSubnets = nodeSubnets
+	}
+
 	// TBD-merge udng.node.Name, needs lower case?
 	udng.mgmtPortController, err = managementport.NewUDNManagementPortController(udng.nodeInformer, udng.node.Name, nodeSubnets, udng.NetInfo)
 	if err != nil {
@@ -903,14 +917,20 @@ func (udng *UserDefinedNetworkGateway) reconcileUplinkConfiguration() (
 		)
 	}
 
-	if udng.uplinkGatewayCleanupRequired &&
+	if err := udng.refreshLocalSubnets(); err != nil {
+		return state.UID, observedFingerprint, err
+	}
+	if udng.uplinkGatewayCleanupRequired && !udng.subnetRefreshPending &&
 		udng.uplinkFingerprint == observedFingerprint {
 		// Readiness-only status changes must not disturb working dataplane.
 		udng.uplinkStateUID = state.UID
 		return state.UID, observedFingerprint, nil
 	}
-	return state.UID, observedFingerprint,
-		udng.replaceUplinkGateway(resolved, state.UID, observedFingerprint)
+	err = udng.replaceUplinkGateway(resolved, state.UID, observedFingerprint)
+	if err == nil {
+		udng.subnetRefreshPending = false
+	}
+	return state.UID, observedFingerprint, err
 }
 
 // reconcileUplinkState makes this CUDN's gateway match the newest informer
@@ -1064,6 +1084,9 @@ func (udng *UserDefinedNetworkGateway) getLocalSubnets() ([]*net.IPNet, error) {
 
 	// fetch subnets which we will use to get management port IP(s)
 	if udng.TopologyType() == types.Layer3Topology {
+		if udng.localSubnets != nil {
+			return udng.localSubnets, nil
+		}
 		networkLocalSubnets, err = util.ParseNodeHostSubnetAnnotation(udng.node, udng.GetNetworkName())
 		if err != nil {
 			return nil, fmt.Errorf("waiting for node %s to start, no annotation found on node for network %s: %w",
@@ -1516,22 +1539,86 @@ func (udng *UserDefinedNetworkGateway) Stop() {
 	udng.mgmtPortController.Stop()
 }
 
-// Reconcile signals reconcileAdvertisedState for advertised-state updates
-// (VRF, isolation, DEFAULT OpenFlow). It does not implement Gateway.Reconcile:
-// the signature has no error, and it must not be confused with the embedded
-// *gateway.Reconcile which resyncs services.
+// Reconcile queues gateway reconciliation for local allocation or advertisement
+// changes. It is distinct from the embedded gateway's Service reconciliation.
 func (udng *UserDefinedNetworkGateway) Reconcile() {
 	udng.gatewayReconciler.Reconcile(udng.GetNetworkName())
 }
 
-func (udng *UserDefinedNetworkGateway) reconcileGateway(_ string) error {
+// ReconcileLocalNode checks the latest allocation without replaying ordinary
+// advertisement programming when the allocation has not changed.
+func (udng *UserDefinedNetworkGateway) ReconcileLocalNode() {
+	udng.gatewayReconciler.Reconcile(udnGatewayLocalNodeReconcileKey)
+}
+
+// refreshLocalSubnets runs under operationMutex. Reuse the full gateway
+// replacement lifecycle: replacing only addresses leaves subnet-derived MACs,
+// routes and shared bridge configuration stale. Never tear down working state
+// while an allocation is temporarily absent.
+func (udng *UserDefinedNetworkGateway) refreshLocalSubnets() error {
+	if udng.TopologyType() != types.Layer3Topology {
+		return nil
+	}
+	node, err := udng.nodeLister.Get(udng.node.Name)
+	if err != nil {
+		return err
+	}
+	subnets, err := util.ParseNodeHostSubnetAnnotation(node, udng.GetNetworkName())
+	if err != nil {
+		return err
+	}
+	current, err := udng.getLocalSubnets()
+	if err != nil {
+		return err
+	}
+	if !udng.subnetRefreshPending && reflect.DeepEqual(current, subnets) {
+		return nil
+	}
+
+	udng.subnetRefreshPending = true
+	if udng.Uplink() != "" {
+		if err := udng.unconfigureUplinkGateway(); err != nil {
+			return err
+		}
+		// reconcileUplinkConfiguration reapplies the latest resolved Uplink
+		// after cleanup, even if its fingerprint did not change.
+		udng.localSubnets = subnets
+		return nil
+	}
+	if err := udng.delNetwork(); err != nil {
+		return err
+	}
+	udng.localSubnets = subnets
+	if err := udng.addNetworkWithResolvedUplink(nil); err != nil {
+		return err
+	}
+	udng.subnetRefreshPending = false
+	return nil
+}
+
+func (udng *UserDefinedNetworkGateway) reconcileGateway(key string) error {
 	udng.operationMutex.Lock()
 	defer udng.operationMutex.Unlock()
+	if err := udng.refreshLocalSubnets(); err != nil {
+		return err
+	}
 	if udng.Uplink() == "" {
+		if key == udnGatewayLocalNodeReconcileKey {
+			return nil
+		}
 		return udng.reconcileAdvertisedState()
 	}
-	// Reconcile and report against the UplinkState configuration last handled by
-	// this gateway, not a newer informer object that has not been handled yet.
+	if udng.subnetRefreshPending {
+		uid, fingerprint, err := udng.reconcileUplinkConfiguration()
+		udng.uplinkStateGatewayStatusController.ReportNetworkResult(
+			udng.NetInfo, uid, fingerprint, err)
+		return err
+	}
+	if key == udnGatewayLocalNodeReconcileKey {
+		return nil
+	}
+	// Ordinary advertisement changes still report against the UplinkState
+	// already handled by this gateway, not a newer discovery event.
 	reconcileErr := udng.reconcileAdvertisedState()
 	udng.uplinkStateGatewayStatusController.ReportNetworkResult(
 		udng.NetInfo, udng.uplinkStateUID, udng.uplinkFingerprint, reconcileErr)

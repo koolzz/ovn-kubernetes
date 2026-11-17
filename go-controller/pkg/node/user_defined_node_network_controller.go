@@ -20,6 +20,7 @@ import (
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/iprulemanager"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/managementport"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/vrfmanager"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 )
 
@@ -103,6 +104,9 @@ func (nc *UserDefinedNodeNetworkController) Start(_ context.Context) error {
 			return fmt.Errorf("failed to start node gateway for network %s at node %s: %w",
 				nc.GetNetworkName(), nc.name, err)
 		}
+		// Node events can arrive before the network manager registers this
+		// controller. Catch up once Start has completed successfully.
+		nc.ReconcileLocalNode()
 	}
 	return nil
 }
@@ -150,6 +154,14 @@ func (nc *UserDefinedNodeNetworkController) Cleanup() error {
 // HandleNetworkRefChange satisfies the NetworkController interface. UDN node controllers only
 // manage local node state, so NAD reference changes for remote nodes are ignored.
 func (nc *UserDefinedNodeNetworkController) HandleNetworkRefChange(_ string, _ bool) {}
+
+// ReconcileLocalNode queues subnet reconciliation independently of NetInfo,
+// which does not carry the node's current allocation.
+func (nc *UserDefinedNodeNetworkController) ReconcileLocalNode() {
+	if nc.gateway != nil && nc.TopologyType() == types.Layer3Topology {
+		nc.gateway.ReconcileLocalNode()
+	}
+}
 
 func (nc *UserDefinedNodeNetworkController) shouldReconcileNetworkChange(old, new util.NetInfo) bool {
 	switch {

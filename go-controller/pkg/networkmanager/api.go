@@ -223,6 +223,13 @@ type ReconcilableNetworkController interface {
 	Reconcile(util.NetInfo) error
 }
 
+// LocalNodeReconciler receives local Node updates independently of NetInfo
+// changes. Implementations must only enqueue work: the network manager calls
+// this while holding its controller-state read lock.
+type LocalNodeReconciler interface {
+	ReconcileLocalNode()
+}
+
 // BaseNetworkController is a ReconcilableNetworkController that can be started and
 // stopped.
 type BaseNetworkController interface {

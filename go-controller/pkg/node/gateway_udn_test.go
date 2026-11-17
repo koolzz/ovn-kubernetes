@@ -78,21 +78,20 @@ func emptyNodeInformer() coreinformers.NodeInformer {
 	return informerfactory.NewSharedInformerFactory(fake.NewSimpleClientset(), 0).Core().V1().Nodes()
 }
 
-func getCreationFakeCommands(fexec *ovntest.FakeExec, mgtPort, mgtPortMAC, netName, nodeName string, mtu int) {
-	fexec.AddFakeCmdsNoOutputNoError([]string{
-		"ovs-vsctl --timeout=15" +
-			" -- --may-exist add-port br-int " + mgtPort +
-			" -- set interface " + mgtPort +
-			fmt.Sprintf(" mac=\"%s\"", mgtPortMAC) +
-			" type=internal mtu_request=" + fmt.Sprintf("%d", mtu) +
-			" external-ids:iface-id=" + types.K8sPrefix + netName + "_" + nodeName +
-			fmt.Sprintf(" external-ids:%s=%s", types.NetworkExternalID, netName),
-	})
-
+func getCreationFakeCommands(fexec *ovntest.FakeExec, mgtPort, mgtPortMAC, netName, nodeName string, mtu int) *ovntest.ExpectedCmd {
+	command := &ovntest.ExpectedCmd{Cmd: "ovs-vsctl --timeout=15" +
+		" -- --may-exist add-port br-int " + mgtPort +
+		" -- set interface " + mgtPort +
+		fmt.Sprintf(" mac=\"%s\"", mgtPortMAC) +
+		" type=internal mtu_request=" + fmt.Sprintf("%d", mtu) +
+		" external-ids:iface-id=" + types.K8sPrefix + netName + "_" + nodeName +
+		fmt.Sprintf(" external-ids:%s=%s", types.NetworkExternalID, netName)}
+	fexec.AddFakeCmd(command)
 	fexec.AddFakeCmd(&ovntest.ExpectedCmd{
 		Cmd:    "sysctl -w net.ipv4.conf." + mgtPort + ".forwarding = 1",
 		Output: "net.ipv4.conf." + mgtPort + ".forwarding = 1",
 	})
+	return command
 }
 
 func getRPFilterLooseModeFakeCommand(fexec *ovntest.FakeExec, ifName string) {
@@ -430,15 +429,15 @@ func resolvedGatewayUplinkState(uplinkName, nodeName string) *uplinkv1alpha1.Upl
 	}
 }
 
-func newUplinkGatewayReconcileHarness(
+func newGatewayReconcileHarness(
 	t *testing.T,
 	state *uplinkv1alpha1.UplinkState,
+	uplinkName string,
 ) (*UserDefinedNetworkGateway, *utilmocks.NetLinkOps, *v1mocks.NodeLister) {
 	t.Helper()
 	const (
-		uplinkName = "uplink1"
-		nodeName   = "node-a"
-		networkID  = "3"
+		nodeName  = "node-a"
+		networkID = "3"
 	)
 
 	nad := generateUplinkNAD("red", "red-nad", "test", types.Layer3Topology,
@@ -506,6 +505,95 @@ func newUplinkGatewayReconcileHarness(
 		close(informerStop)
 	})
 	return udnGateway, netlinkOps, nodeLister
+}
+
+func newUplinkGatewayReconcileHarness(t *testing.T, state *uplinkv1alpha1.UplinkState) (*UserDefinedNetworkGateway, *utilmocks.NetLinkOps, *v1mocks.NodeLister) {
+	t.Helper()
+	return newGatewayReconcileHarness(t, state, "uplink1")
+}
+
+func TestUDNGatewaySubnetRefreshPreservesCleanupOwnership(t *testing.T) {
+	if err := config.PrepareTestConfig(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = config.PrepareTestConfig() })
+	config.OvnKubeNode.Mode = types.NodeModeDPU
+	config.Gateway.Mode = config.GatewayModeShared
+	config.Gateway.V4MasqueradeSubnet = "169.254.0.0/17"
+	config.IPv4Mode = true
+	config.OVNKubernetesFeature.EnableMultiNetwork = true
+	config.OVNKubernetesFeature.EnableNetworkSegmentation = true
+	config.OVNKubernetesFeature.EnableUplink = true
+
+	for _, uplinkName := range []string{"", "uplink1"} {
+		t.Run("uplink="+uplinkName, func(t *testing.T) {
+			t.Run("absent allocation preserves working state and failed cleanup cannot be skipped on revert", func(t *testing.T) {
+				state := resolvedGatewayUplinkState("uplink1", "node-a")
+				gw, nl, lister := newGatewayReconcileHarness(t, state, uplinkName)
+				lister.On("Get", "node-a").Return(gw.node, nil).Once()
+				gw.uplinkGatewayCleanupRequired = uplinkName != ""
+				if err := gw.refreshLocalSubnets(); err != nil {
+					t.Fatal(err)
+				}
+				missing := gw.node.DeepCopy()
+				delete(missing.Annotations, types.NodeSubnetsAnnotation)
+				lister.On("Get", "node-a").Return(missing, nil).Once()
+				if err := gw.refreshLocalSubnets(); err == nil {
+					t.Fatal("missing allocation must wait")
+				}
+				if gw.subnetRefreshPending || gw.uplinkGatewayCleanupRequired != (uplinkName != "") {
+					t.Fatal("missing allocation changed working ownership")
+				}
+				changed := gw.node.DeepCopy()
+				changed.Annotations[types.NodeSubnetsAnnotation] = `{"red":["100.128.1.0/24"]}`
+				cleanupErr := errors.New("VRF cleanup failed")
+				nl.On("LinkByName", util.GetNetworkVRFName(gw.NetInfo)).Return(nil, cleanupErr).Twice()
+				nl.On("IsLinkNotFoundError", cleanupErr).Return(false).Twice()
+				lister.On("Get", "node-a").Return(changed, nil).Once()
+				if err := gw.refreshLocalSubnets(); err == nil || !strings.Contains(err.Error(), cleanupErr.Error()) {
+					t.Fatalf("expected cleanup failure: %v", err)
+				}
+				lister.On("Get", "node-a").Return(gw.node, nil).Once()
+				if err := gw.refreshLocalSubnets(); err == nil || !gw.subnetRefreshPending {
+					t.Fatalf("reverted allocation skipped pending cleanup: %v", err)
+				}
+			})
+
+			t.Run("coalesced allocations retry partial programming using the latest subnet", func(t *testing.T) {
+				state := resolvedGatewayUplinkState("uplink1", "node-a")
+				gw, nl, lister := newGatewayReconcileHarness(t, state, uplinkName)
+				lister.On("Get", "node-a").Return(gw.node, nil).Once()
+				if err := gw.refreshLocalSubnets(); err != nil {
+					t.Fatal(err)
+				}
+				gw.uplinkGatewayCleanupRequired = uplinkName != ""
+				gw.uplinkFingerprint = uplinkGatewayFingerprintFromState(state)
+				for _, cidr := range []string{"100.128.1.0/24", "100.128.2.0/24"} {
+					node := gw.node.DeepCopy()
+					node.Annotations[types.NodeSubnetsAnnotation] = fmt.Sprintf(`{"red":[%q]}`, cidr)
+					lister.On("Get", "node-a").Return(node, nil).Once()
+					expectMissingGatewayVRF(nl, gw)
+					addErr := errors.New("management port lookup failed")
+					lister.On("Get", "node-a").Return(nil, addErr).Once()
+					var err error
+					if uplinkName == "" {
+						err = gw.refreshLocalSubnets()
+					} else {
+						_, _, err = gw.reconcileUplinkConfiguration()
+					}
+					if err == nil || !strings.Contains(err.Error(), addErr.Error()) {
+						t.Fatalf("expected partial programming failure: %v", err)
+					}
+					if !gw.subnetRefreshPending || gw.uplinkGatewayCleanupRequired != (uplinkName != "") {
+						t.Fatal("partial replacement lost cleanup ownership")
+					}
+					if len(gw.localSubnets) != 1 || gw.localSubnets[0].String() != cidr {
+						t.Fatalf("did not use latest allocation: %v", gw.localSubnets)
+					}
+				}
+			})
+		})
+	}
 }
 
 func expectMissingGatewayVRF(
@@ -592,7 +680,8 @@ func TestUserDefinedNetworkGatewayReconcilesUplinkConfiguration(t *testing.T) {
 	t.Run("unchanged configuration preserves programming", func(t *testing.T) {
 		state := resolvedGatewayUplinkState("uplink1", "node-a")
 		state.UID = "new-uid"
-		udnGateway, _, _ := newUplinkGatewayReconcileHarness(t, state)
+		udnGateway, _, nodeLister := newUplinkGatewayReconcileHarness(t, state)
+		nodeLister.On("Get", "node-a").Return(udnGateway.node, nil).Once()
 		current := uplinkGatewayFingerprintFromState(state)
 		udnGateway.uplinkGatewayCleanupRequired = true
 		udnGateway.uplinkStateUID = "old-uid"
@@ -612,7 +701,8 @@ func TestUserDefinedNetworkGatewayReconcilesUplinkConfiguration(t *testing.T) {
 	t.Run("advertisement reconciliation reports handled UplinkState identity", func(t *testing.T) {
 		state := resolvedGatewayUplinkState("uplink1", "node-a")
 		state.UID = "new-uid"
-		udnGateway, _, _ := newUplinkGatewayReconcileHarness(t, state)
+		udnGateway, _, nodeLister := newUplinkGatewayReconcileHarness(t, state)
+		nodeLister.On("Get", "node-a").Return(udnGateway.node, nil).Once()
 		udnGateway.uplinkGatewayCleanupRequired = true
 		udnGateway.uplinkStateUID = "old-uid"
 		udnGateway.uplinkFingerprint = uplinkGatewayFingerprintFromState(state)
@@ -636,6 +726,7 @@ func TestUserDefinedNetworkGatewayReconcilesUplinkConfiguration(t *testing.T) {
 		oldState := state.DeepCopy()
 		oldState.Status.IPAddresses = []uplinkv1alpha1.IPAddressCIDR{"192.0.2.9/24"}
 		udnGateway, netlinkOps, nodeLister := newUplinkGatewayReconcileHarness(t, state)
+		nodeLister.On("Get", "node-a").Return(udnGateway.node, nil).Once()
 		udnGateway.uplinkGatewayCleanupRequired = true
 		udnGateway.uplinkStateUID = "old-uid"
 		udnGateway.uplinkFingerprint = uplinkGatewayFingerprintFromState(oldState)
@@ -663,6 +754,7 @@ func TestUserDefinedNetworkGatewayReconcilesUplinkConfiguration(t *testing.T) {
 	t.Run("resolved state starts initial programming", func(t *testing.T) {
 		state := resolvedGatewayUplinkState("uplink1", "node-a")
 		udnGateway, _, nodeLister := newUplinkGatewayReconcileHarness(t, state)
+		nodeLister.On("Get", "node-a").Return(udnGateway.node, nil).Once()
 		addErr := errors.New("management port lookup failed")
 		nodeLister.On("Get", "node-a").Return(nil, addErr).Once()
 
@@ -1417,7 +1509,7 @@ var _ = Describe("UserDefinedNetworkGateway", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(fexec.CalledMatchesExpected()).To(BeTrue(), fexec.ErrorDesc)
 	})
-	ovntest.OnSupportedPlatformsIt("should create and delete correct openflows on breth0 for a L3 user defined network", func() {
+	testL3Gateway := func(reallocate bool) {
 		config.IPv4Mode = true
 		config.IPv6Mode = true
 		config.Gateway.Interface = "eth0"
@@ -1438,6 +1530,7 @@ var _ = Describe("UserDefinedNetworkGateway", func() {
 				{Type: corev1.NodeInternalIP, Address: strings.Split(v6NodeIP, "/")[0]}},
 			},
 		}
+		node.UID = "unchanged-node"
 		nad := ovntest.GenerateNAD(netName, "rednad", "greenamespace",
 			types.Layer3Topology, "100.128.0.0/16/24,ae70::/60/64", types.NetworkRolePrimary)
 		ovntest.AnnotateNADWithNetworkID(netID, nad)
@@ -1620,6 +1713,68 @@ var _ = Describe("UserDefinedNetworkGateway", func() {
 				bridgeconfig.CheckUDNSvcIsolationOVSFlows(flowMap["DEFAULT"], bridgeUdnConfig, "bluenet", svcCIDR, 1)
 			}
 
+			if reallocate {
+				oldTable := udnGateway.vrfTableId
+				missing := node.DeepCopy()
+				missing.Annotations[types.NodeSubnetsAnnotation] = fmt.Sprintf(`{"default":[%q]}`, v4NodeSubnet)
+				Expect(wf.NodeCoreInformer().Informer().GetIndexer().Update(missing)).To(Succeed())
+				if err := udnGateway.reconcileGateway(udnGatewayLocalNodeReconcileKey); err != nil {
+					Expect(util.IsAnnotationNotSetError(err)).To(BeTrue())
+				}
+				Expect(udnGateway.vrfTableId).To(Equal(oldTable))
+				Expect(udnGateway.openflowManager.defaultBridge.GetNetworkConfig(netName)).To(Equal(bridgeUdnConfig))
+
+				updated := node.DeepCopy()
+				updated.Annotations[types.NodeSubnetsAnnotation] = fmt.Sprintf(`{"default":[%q],%q:["100.128.1.0/24","ae70:0:0:1::/64"]}`, v4NodeSubnet, netName)
+				Expect(wf.NodeCoreInformer().Informer().GetIndexer().Update(updated)).To(Succeed())
+				deleteStaleManagementPortFakeCommands(fexec, mgtPort)
+				newSubnets := ovntest.MustParseIPNets("100.128.1.0/24", "ae70:0:0:1::/64")
+				newMAC := util.IPAddrToHWAddr(netInfo.GetNodeManagementIP(newSubnets[0]).IP)
+				create := getCreationFakeCommands(fexec, mgtPort, newMAC.String(), netName, nodeName, netInfo.MTU())
+				// Emulate ovs-vswitchd creating the Linux device after del-port
+				// removed the previous one. Kernel addresses/routes remain real.
+				create.Action = func() error {
+					return netlink.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: mgtPort, HardwareAddr: newMAC}})
+				}
+				getRPFilterLooseModeFakeCommands(fexec)
+				setUpUDNOpenflowManagerFakeOVSCommands(fexec)
+				getDeletionFakeOVSCommands(fexec, mgtPort)
+				Expect(udnGateway.reconcileGateway(udnGatewayLocalNodeReconcileKey)).To(Succeed())
+				Expect(udnGateway.subnetRefreshPending).To(BeFalse())
+				Expect(udnGateway.node).To(Equal(node), "the immutable Node identity must not be replaced")
+				bridgeUdnConfig = udnGateway.openflowManager.defaultBridge.GetNetworkConfig(netName)
+				Expect(bridgeUdnConfig.NodeSubnets).To(Equal(newSubnets))
+				Expect(bridgeUdnConfig.ManagementIPs).To(Equal([]*net.IPNet{netInfo.GetNodeManagementIP(newSubnets[0]), netInfo.GetNodeManagementIP(newSubnets[1])}))
+				link, err := netlink.LinkByName(mgtPort)
+				Expect(err).NotTo(HaveOccurred())
+				addresses, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+				Expect(err).NotTo(HaveOccurred())
+				var actual []string
+				for _, addr := range addresses {
+					if !addr.IP.IsLinkLocalUnicast() {
+						actual = append(actual, addr.IPNet.String())
+					}
+				}
+				Expect(actual).To(ConsistOf("100.128.1.2/24", "ae70:0:0:1::2/64"))
+				Expect(link.Attrs().HardwareAddr).To(Equal(newMAC))
+				routes, err := netlink.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{Table: udnGateway.vrfTableId}, netlink.RT_FILTER_TABLE)
+				Expect(err).NotTo(HaveOccurred())
+				var gateways []string
+				for _, route := range routes {
+					if route.Gw != nil {
+						gateways = append(gateways, route.Gw.String())
+					}
+				}
+				Expect(gateways).To(ContainElements("100.128.1.1", "ae70:0:0:1::1"))
+				Expect(gateways).NotTo(ContainElement("100.128.0.1"))
+				Expect(gateways).NotTo(ContainElement("ae70::1"))
+				Expect(udnGateway.openflowManager.defaultBridge.GetNetworkConfig("default")).To(Equal(defaultUdnConfig))
+				flowMap = udnGateway.openflowManager.defaultBridge.flowCache
+				for _, svcCIDR := range config.Kubernetes.ServiceCIDRs {
+					bridgeconfig.CheckUDNSvcIsolationOVSFlows(flowMap["DEFAULT"], bridgeUdnConfig, netName, svcCIDR, 1)
+				}
+			}
+
 			// The second call to checkPorts() will return no ofPort for the UDN - simulating a deletion that already was
 			// processed by ovn-northd/ovn-controller.  We should not be panicking on that.
 			removeOVSPatchPortInterface(ovsClient, "breth0", "patch-breth0_bluenet_worker1-to-br-int")
@@ -1652,7 +1807,10 @@ var _ = Describe("UserDefinedNetworkGateway", func() {
 		})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(fexec.CalledMatchesExpected()).To(BeTrue(), fexec.ErrorDesc)
-	})
+	}
+	ovntest.OnSupportedPlatformsIt("should create and delete correct openflows on breth0 for a L3 user defined network", func() { testL3Gateway(false) })
+	ovntest.OnSupportedPlatformsIt("should create and delete correct openflows on breth0 for a L3 user defined network after live subnet reallocation", func() { testL3Gateway(true) })
+
 	ovntest.OnSupportedPlatformsIt("should handle gateway delete idempotently for a L3 user defined network", func() {
 		config.IPv4Mode = true
 		config.IPv6Mode = true

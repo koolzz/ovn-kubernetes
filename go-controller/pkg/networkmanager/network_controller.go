@@ -83,14 +83,18 @@ func newNetworkController(name, node string, cm ControllerManager, wf watchFacto
 			nc.name,
 			raConfig,
 		)
+	}
 
-		// node controller
+	// Share one Node listener across networks. A subnet allocation can change
+	// without changing NetInfo or RouteAdvertisements.
+	if nc.hasRouteAdvertisements() || node != "" {
+		nc.nodeLister = wf.NodeCoreInformer().Lister()
 		nodeConfig := &controller.ControllerConfig[corev1.Node]{
 			RateLimiter:    workqueue.DefaultTypedControllerRateLimiter[string](),
 			Informer:       wf.NodeCoreInformer().Informer(),
 			Lister:         nc.nodeLister.List,
-			Reconcile:      func(string) error { return nc.syncRunningNetworks() },
-			ObjNeedsUpdate: nodeNeedsUpdate,
+			Reconcile:      nc.syncNode,
+			ObjNeedsUpdate: nc.nodeNeedsUpdate,
 			Threadiness:    1,
 		}
 		nc.nodeController = controller.NewController(
@@ -395,6 +399,33 @@ func (c *networkController) syncAll() error {
 		}
 	}
 	klog.Infof("%s: finished syncing all networks. Time taken: %s", c.name, time.Since(start))
+	return nil
+}
+
+func (c *networkController) nodeNeedsUpdate(oldNode, newNode *corev1.Node) bool {
+	if c.hasRouteAdvertisements() && nodeNeedsUpdate(oldNode, newNode) {
+		return true
+	}
+	return newNode != nil && newNode.Name == c.node &&
+		(oldNode == nil || util.NodeSubnetAnnotationChanged(oldNode, newNode))
+}
+
+func (c *networkController) syncNode(name string) error {
+	if name == c.node {
+		c.RLock()
+		for _, state := range c.networkControllers {
+			if state.stoppedAndDeleting || state.startFailed {
+				continue
+			}
+			if reconciler, ok := state.controller.(LocalNodeReconciler); ok {
+				reconciler.ReconcileLocalNode()
+			}
+		}
+		c.RUnlock()
+	}
+	if c.hasRouteAdvertisements() {
+		return c.syncRunningNetworks()
+	}
 	return nil
 }
 
