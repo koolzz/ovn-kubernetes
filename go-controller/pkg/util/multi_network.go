@@ -1956,22 +1956,18 @@ func getPodNADToNetworkMappingWithPredicate(
 	// calculate numbers of network elements of that same NAD.
 	nNADs := map[string]int{}
 	for _, network := range allNetworks {
-		nadNamespace := network.Namespace
-		if nadNamespace == "" {
-			nadNamespace = pod.Namespace
-		}
-		nadName := GetNADName(nadNamespace, network.Name)
+		nadName := network.nadKey
 		if !nadMatches(nadName) {
 			continue
 		}
 		if nInfo.IsPrimaryNetwork() {
-			return false, nil, fmt.Errorf("unexpected primary network %q specified with a NetworkSelectionElement %+v", nInfo.GetNetworkName(), network)
+			return false, nil, fmt.Errorf("unexpected primary network %q specified with a NetworkSelectionElement %+v", nInfo.GetNetworkName(), network.NetworkSelectionElement)
 		}
 
 		// for multiple NetworkSelectionElements of the same NAD, set its nadName to indexed nadName
 		cnt := nNADs[nadName]
 		nNADs[nadName] = cnt + 1
-		networkSelections[GetIndexedNADKey(nadName, cnt)] = copyNetworkSelection(network)
+		networkSelections[GetIndexedNADKey(nadName, cnt)] = copyNetworkSelection(network.NetworkSelectionElement)
 	}
 
 	if len(networkSelections) == 0 {
@@ -2314,11 +2310,7 @@ func GetNetworkRole(
 		return "", fmt.Errorf("failed to get pod network mapping: %w", err)
 	}
 	for _, network := range allNetworks {
-		nadNamespace := network.Namespace
-		if nadNamespace == "" {
-			nadNamespace = pod.Namespace
-		}
-		nadKey := GetNADName(nadNamespace, network.Name)
+		nadKey := network.nadKey
 		networkName := getNetworkNameForNADKey(nadKey)
 		if networkName == "" {
 			continue

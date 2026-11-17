@@ -580,7 +580,7 @@ func GetK8sPodAllNetworkSelections(pod *corev1.Pod) ([]*nadapi.NetworkSelectionE
 	}
 	copies := make([]*nadapi.NetworkSelectionElement, len(networks))
 	for i, network := range networks {
-		copies[i] = copyNetworkSelection(network)
+		copies[i] = copyNetworkSelection(network.NetworkSelectionElement)
 	}
 	return copies, nil
 }

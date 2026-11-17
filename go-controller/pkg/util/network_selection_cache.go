@@ -17,14 +17,19 @@ import (
 
 const (
 	networkSelectionCacheEntries = 4096
-	// Bound encoded input, not decoded heap usage. A per-entry admission limit
-	// keeps this budget without custom byte accounting or eviction logic.
+	// Bound encoded input and qualified NAD names, not decoded heap usage.
+	// A per-entry limit keeps the budget without custom eviction logic.
 	networkSelectionCacheBytes = 8 * 1024 * 1024
 )
 
 type networkSelectionKey struct {
 	namespace  string
 	annotation string
+}
+
+type parsedNetworkSelection struct {
+	*nadapi.NetworkSelectionElement
+	nadKey string
 }
 
 // Cached values are immutable. Only syntax is cached: NAD and primary-network
@@ -46,16 +51,16 @@ func newNetworkSelectionCache(maxEntries, maxBytes int) *networkSelectionCache {
 }
 
 // get returns read-only selections. Callers must copy any values they expose.
-func (c *networkSelectionCache) get(namespace, annotation string) ([]*nadapi.NetworkSelectionElement, error) {
+func (c *networkSelectionCache) get(namespace, annotation string) ([]parsedNetworkSelection, error) {
 	if annotation == "" {
-		return []*nadapi.NetworkSelectionElement{}, nil
-	}
-	if len(namespace)+len(annotation) > c.maxEntryBytes {
-		return nadutils.ParseNetworkAnnotation(annotation, namespace)
+		return []parsedNetworkSelection{}, nil
 	}
 	key := networkSelectionKey{namespace: namespace, annotation: annotation}
-	if selections, ok := c.cache.Get(key); ok {
-		return selections.([]*nadapi.NetworkSelectionElement), nil
+	entryBytes := len(namespace) + len(annotation)
+	if entryBytes <= c.maxEntryBytes {
+		if selections, ok := c.cache.Get(key); ok {
+			return selections.([]parsedNetworkSelection), nil
+		}
 	}
 
 	// Parse outside the cache lock so unrelated misses and hits can proceed.
@@ -65,11 +70,26 @@ func (c *networkSelectionCache) get(namespace, annotation string) ([]*nadapi.Net
 	if err != nil {
 		return nil, err
 	}
-	c.cache.Add(key, selections)
-	return selections, nil
+	var parsed []parsedNetworkSelection
+	if selections != nil {
+		parsed = make([]parsedNetworkSelection, len(selections))
+	}
+	for i, selection := range selections {
+		nadNamespace := selection.Namespace
+		if nadNamespace == "" {
+			nadNamespace = namespace
+		}
+		nadKey := GetNADName(nadNamespace, selection.Name)
+		parsed[i] = parsedNetworkSelection{NetworkSelectionElement: selection, nadKey: nadKey}
+		entryBytes += len(nadKey)
+	}
+	if entryBytes <= c.maxEntryBytes {
+		c.cache.Add(key, parsed)
+	}
+	return parsed, nil
 }
 
-func getReadOnlyNetworkSelections(pod *corev1.Pod) ([]*nadapi.NetworkSelectionElement, error) {
+func getReadOnlyNetworkSelections(pod *corev1.Pod) ([]parsedNetworkSelection, error) {
 	selections, err := parsedNetworkSelections.get(pod.Namespace, pod.Annotations[nadapi.NetworkAttachmentAnnot])
 	if err != nil {
 		return nil, fmt.Errorf("failed to get all NetworkSelectionElements for pod %s/%s: %v", pod.Namespace, pod.Name, err)

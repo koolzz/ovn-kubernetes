@@ -21,8 +21,19 @@ func selectionPod(namespace, annotation string) *corev1.Pod {
 	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "pod", Annotations: map[string]string{nadapi.NetworkAttachmentAnnot: annotation}}}
 }
 
+func selectionValues(selections []parsedNetworkSelection) []*nadapi.NetworkSelectionElement {
+	if selections == nil {
+		return nil
+	}
+	values := make([]*nadapi.NetworkSelectionElement, len(selections))
+	for i, selection := range selections {
+		values[i] = selection.NetworkSelectionElement
+	}
+	return values
+}
+
 func TestNetworkSelectionCacheSemantics(t *testing.T) {
-	annotations := []string{"", "net, other/net@if1,net@if2", `[]`, `[{"name":"net"},{"name":"net","namespace":"other","interface":"eth2","ips":["10.0.0.1","2001:db8::1"],"mac":"00:11:22:33:44:55","infiniband-guid":"guid","ipam-claim-reference":"claim","portMappings":[{"hostPort":80,"containerPort":8080,"protocol":"tcp"}],"bandwidth":{"ingressRate":123},"cni-args":{"nested":[{"key":"value"}]},"default-route":["10.0.0.2","2001:db8::2"]}]`, `[`, "bad/name/format"}
+	annotations := []string{"", "net, other/net@if1,net@if2", `[]`, `null`, `[{"name":"net"},{"name":"net","namespace":"other","interface":"eth2","ips":["10.0.0.1","2001:db8::1"],"mac":"00:11:22:33:44:55","infiniband-guid":"guid","ipam-claim-reference":"claim","portMappings":[{"hostPort":80,"containerPort":8080,"protocol":"tcp"}],"bandwidth":{"ingressRate":123},"cni-args":{"nested":[{"key":"value"}]},"default-route":["10.0.0.2","2001:db8::2"]}]`, `[`, "bad/name/format"}
 	c := newNetworkSelectionCache(3, 4096)
 	for _, namespace := range []string{"first", "second"} {
 		for _, annotation := range annotations {
@@ -36,7 +47,7 @@ func TestNetworkSelectionCacheSemantics(t *testing.T) {
 				if (err != nil) != (wantErr != nil) {
 					t.Fatalf("%q: got error %v, want %v", annotation, err, wantErr)
 				}
-				if err == nil && !reflect.DeepEqual(got, want) {
+				if err == nil && !reflect.DeepEqual(selectionValues(got), want) {
 					t.Fatalf("%q: got %#v, want %#v", annotation, got, want)
 				}
 			}
@@ -96,7 +107,7 @@ func TestNetworkSelectionCacheAdmissionAndEviction(t *testing.T) {
 		t.Helper()
 		got, err := c.get("ns", annotation)
 		want, wantErr := nadutils.ParseNetworkAnnotation(annotation, "ns")
-		if err != nil || wantErr != nil || !reflect.DeepEqual(got, want) {
+		if err != nil || wantErr != nil || !reflect.DeepEqual(selectionValues(got), want) {
 			t.Fatalf("parse %q: got %v, %v; want %v, %v", annotation, got, err, want, wantErr)
 		}
 	}
@@ -112,9 +123,9 @@ func TestNetworkSelectionCacheAdmissionAndEviction(t *testing.T) {
 		t.Fatal("inserting a third entry must evict the least recently used entry")
 	}
 
-	// Include namespace bytes in the admission threshold. Even a full cache
-	// of admitted entries must fit the encoded-input budget.
-	boundary := strings.Repeat("a", 18)
+	// Include namespace, annotation and qualified-key bytes in admission.
+	// Even a full cache must fit the input-and-key byte budget.
+	boundary := strings.Repeat("a", 7)
 	get(boundary)
 	if !contains(boundary) {
 		t.Fatal("entry at the size limit was not admitted")
@@ -152,7 +163,7 @@ func TestNetworkSelectionCacheConcurrentEviction(t *testing.T) {
 					t.Errorf("incorrect parse during eviction: %v, %v", got, err)
 					return
 				}
-				copy := copyNetworkSelection(got[0])
+				copy := copyNetworkSelection(got[0].NetworkSelectionElement)
 				copy.IPRequest[0] = "changed"
 				if got[0].IPRequest[0] != "10.0.0.1" {
 					t.Error("copy mutated a shared parse result")
@@ -242,5 +253,38 @@ func BenchmarkNetworkSelectionFanout(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestNetworkSelectionQualifiedKeys(t *testing.T) {
+	c := newNetworkSelectionCache(4, 4096)
+	for _, namespace := range []string{"first", "second", "first"} {
+		for _, annotation := range []string{"net,other/net@if1,net@if2", `[{"name":"net"},{"name":"net","namespace":"other"}]`} {
+			for range 2 {
+				got, err := c.get(namespace, annotation)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, selection := range got {
+					want := selection.Namespace + "/" + selection.Name
+					if selection.nadKey != want {
+						t.Fatalf("qualified key %q, want %q", selection.nadKey, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestNetworkSelectionDerivedKeyAdmission(t *testing.T) {
+	c := newNetworkSelectionCache(2, 128)
+	namespace := strings.Repeat("n", 63)
+	// Input alone fits64 bytes, but its qualified name does not.
+	got, err := c.get(namespace, "a")
+	if err != nil || len(got) != 1 || got[0].nadKey != namespace+"/a" {
+		t.Fatalf("oversized derived key changed parsing: %v %v", got, err)
+	}
+	if c.cache.Len() != 0 {
+		t.Fatal("derived key bytes bypassed cache admission")
 	}
 }
