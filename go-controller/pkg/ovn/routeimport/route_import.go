@@ -222,9 +222,15 @@ func (c *controller) subscribe(stop <-chan struct{}) {
 					continue
 				}
 				routeEventCh = subscribeNetlinkRouteEvents(c.netlink, stop, onError)
+				if routeEventCh != nil {
+					c.reconcileAllNetworks()
+				}
 			case r, open := <-routeEventCh:
 				if !open {
 					routeEventCh = subscribeNetlinkRouteEvents(c.netlink, stop, onError)
+					if routeEventCh != nil {
+						c.reconcileAllNetworks()
+					}
 					continue
 				}
 				c.log.V(5).Info("Received route event", "event", r)
@@ -249,10 +255,15 @@ func (c *controller) subscribe(stop <-chan struct{}) {
 					continue
 				}
 				linkEventCh = subscribeNetlinkLinkEvents(c.netlink, stop, onError)
+				if linkEventCh != nil {
+					c.reconcileAllNetworks()
+				}
 			case l, open := <-linkEventCh:
 				if !open {
-					c.tables = map[int]int{}
 					linkEventCh = subscribeNetlinkLinkEvents(c.netlink, stop, onError)
+					if linkEventCh != nil {
+						c.reconcileAllNetworks()
+					}
 					continue
 				}
 				c.log.V(5).Info("Received link event", "event", l)
@@ -318,6 +329,18 @@ func (c *controller) syncLinkUpdate(update *netlink.LinkUpdate) {
 
 func (c *controller) reconcile(network string) {
 	c.reconciler.ReconcileAfter(network, reconcileDelay)
+}
+
+// Lost notifications can include withdrawals, which subscription replay does not
+// recover. Keep the table hints (including the default network's main table) so
+// route events still trigger reconciliation; syncNetwork reads the current VRF
+// table and routes from netlink rather than trusting those hints.
+func (c *controller) reconcileAllNetworks() {
+	c.RLock()
+	defer c.RUnlock()
+	for network := range c.networks {
+		c.reconcile(network)
+	}
 }
 
 type route struct {

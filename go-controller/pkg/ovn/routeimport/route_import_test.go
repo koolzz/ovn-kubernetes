@@ -985,5 +985,5 @@ func Test_controller_subscribe(t *testing.T) {
 	close(lch)
 
 	g.Eventually(isLinkEventChSet).WithTimeout(subscribePeriod * 3).Should(gomega.Succeed())
-	g.Expect(c.tables).To(gomega.BeEmpty())
+	g.Expect(c.tables).To(gomega.Equal(map[int]int{1: 1}))
 }
