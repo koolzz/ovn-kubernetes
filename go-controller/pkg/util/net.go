@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -301,7 +302,15 @@ func MatchAllIPStringFamily(isIPv6 bool, ipStrings []string) ([]string, error) {
 func MatchAllIPNetsStringFamily(isIPv6 bool, ipnets []string) []string {
 	var out []string
 	for _, ipnet := range ipnets {
-		if utilnet.IsIPv6CIDRString(ipnet) == isIPv6 {
+		// Family classification does not need an allocated net.IPNet. Keep
+		// sloppy parsing and invalid-input grouping compatible on the slow path.
+		var ipv6 bool
+		if prefix, err := netip.ParsePrefix(ipnet); err == nil {
+			ipv6 = prefix.Addr().Unmap().Is6()
+		} else {
+			ipv6 = utilnet.IsIPv6CIDRString(ipnet)
+		}
+		if ipv6 == isIPv6 {
 			out = append(out, ipnet)
 		}
 	}
