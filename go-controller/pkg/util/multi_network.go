@@ -357,8 +357,17 @@ func (nInfo *mutableNetInfo) SetPodNetworkAdvertisedVRFs(podAdvertisements map[s
 func (nInfo *mutableNetInfo) setPodNetworkAdvertisedOnVRFs(podAdvertisements map[string][]string) {
 	nInfo.podNetworkAdvertisements = make(map[string][]string, len(podAdvertisements))
 	for node, vrfs := range podAdvertisements {
-		nInfo.podNetworkAdvertisements[node] = sets.List(sets.New(vrfs...))
+		nInfo.podNetworkAdvertisements[node] = sortedUniqueVRFs(vrfs)
 	}
+}
+
+func sortedUniqueVRFs(vrfs []string) []string {
+	// One VRF needs neither sorting nor deduplication, but the result must
+	// still be copied so callers cannot mutate the stored advertisement.
+	if len(vrfs) == 1 {
+		return []string{vrfs[0]}
+	}
+	return sets.List(sets.New(vrfs...))
 }
 
 func (nInfo *mutableNetInfo) GetPodNetworkAdvertisedVRFs() map[string][]string {
@@ -389,7 +398,7 @@ func (nInfo *mutableNetInfo) SetEgressIPAdvertisedVRFs(eipAdvertisements map[str
 func (nInfo *mutableNetInfo) setEgressIPAdvertisedAtNodes(eipAdvertisements map[string][]string) {
 	nInfo.eipAdvertisements = make(map[string][]string, len(eipAdvertisements))
 	for node, vrfs := range eipAdvertisements {
-		nInfo.eipAdvertisements[node] = sets.List(sets.New(vrfs...))
+		nInfo.eipAdvertisements[node] = sortedUniqueVRFs(vrfs)
 	}
 }
 
